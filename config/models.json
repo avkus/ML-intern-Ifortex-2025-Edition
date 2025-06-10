@@ -1,32 +1,14 @@
 [
     {
       "displayName": "Llama 3.3 70B Instruct (Fast FP8)",
-      "modelId": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-      "provider": "Cloudflare AI",
-      "notes": "Мощная модель, быстрая версия с FP8 квантованием."
-    },
-    {
-      "displayName": "Llama 3.2 8B Instruct",
-      "modelId": "@cf/meta/llama-3.2-8b-instruct",
-      "provider": "Cloudflare AI",
-      "notes": "Более компактная и быстрая модель Llama 3."
+      "modelId": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
     },
     {
       "displayName": "Mistral 7B Instruct v0.1",
-      "modelId": "@cf/mistral/mistral-7b-instruct-v0.1",
-      "provider": "Cloudflare AI",
-      "notes": "Популярная и эффективная модель с 7 миллиардами параметров."
+      "modelId": "@cf/mistral/mistral-7b-instruct-v0.1"
     },
     {
-      "displayName": "Mistral Small 3.1 24B Instruct",
-      "modelId": "@cf/mistralai/mistral-small-3.1-24b-instruct",
-      "provider": "Cloudflare AI",
-      "notes": "Более новая и мощная модель от Mistral AI (если доступна в CF)."
-    },
-    {
-      "displayName": "Placeholder (Заглушка для UI Теста)",
-      "modelId": "placeholder_true",
-      "provider": "Local",
-      "notes": "Использует заглушку вместо реального вызова LLM."
+      "displayName": "ЗАГЛУШКА (Placeholder for UI Test)",
+      "modelId": "placeholder"
     }
   ]
