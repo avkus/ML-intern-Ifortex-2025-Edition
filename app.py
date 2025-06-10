@@ -1,16 +1,62 @@
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
+import requests # Used by get_summary_from_llama
+from bs4 import BeautifulSoup # Still needed for clean_user_text (if any, or general parsing)
 import os
 import json
-import tiktoken # Added for MapReduce
-from dotenv import load_dotenv # Added for .env support
+import tiktoken
+from dotenv import load_dotenv
+import httpx # Added for Crawl4AI
+from typing import Optional # For the return type
+import re # For clean_user_text
 
 # Load environment variables from .env file if it exists
 # This should be one of the first things to run
 load_dotenv()
 
 # --- Constants and Session State ---
+CRAWL4AI_API_URL = "https://crawl4ai.interfabrika.online/md"
+
+DEFAULT_PLACEHOLDER_MODEL = {
+    "displayName": "ЗАГЛУШКА (Ошибка Загрузки Конфига)", # Consistent displayName for placeholder type
+    "modelId": "placeholder", # Changed from "placeholder_true"
+    "provider": "Local",
+    "notes": "Используется из-за ошибки загрузки models.json. Проверьте файл."
+}
+
+def load_models_config(file_path: str = "models.json") -> list[dict]:
+    """Loads LLM models configuration from a JSON file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            models = json.load(f)
+        if not isinstance(models, list) or not all(isinstance(m, dict) for m in models):
+            print(f"ERROR: {file_path} has invalid format. Expected a list of dictionaries.")
+            return [DEFAULT_PLACEHOLDER_MODEL]
+        # Ensure there's at least one model, or add placeholder if list is empty
+        if not models:
+             print(f"WARNING: {file_path} is empty. Using default placeholder model.")
+             return [DEFAULT_PLACEHOLDER_MODEL]
+        return models
+    except FileNotFoundError:
+        print(f"ERROR: Models configuration file '{file_path}' not found. Using default placeholder model.")
+        return [DEFAULT_PLACEHOLDER_MODEL]
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Failed to decode JSON from '{file_path}': {e}. Using default placeholder model.")
+        return [DEFAULT_PLACEHOLDER_MODEL]
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred while loading '{file_path}': {e}. Using default placeholder model.")
+        return [DEFAULT_PLACEHOLDER_MODEL]
+
+# --- Load models configuration on application start ---
+AVAILABLE_MODELS = load_models_config() # Load models globally
+
+# --- Session State Initialization (ensure it's after AVAILABLE_MODELS if it depends on it for defaults) ---
+if 'selected_model_display_name' not in st.session_state:
+    if AVAILABLE_MODELS: # Check if AVAILABLE_MODELS is not empty
+        st.session_state.selected_model_display_name = AVAILABLE_MODELS[0]['displayName']
+    else:
+        # This case should ideally not happen if load_models_config always returns a default
+        st.session_state.selected_model_display_name = "No models loaded"
+
 TOKEN_THRESHOLD = 3500  # Max tokens for direct summarization (conservative for Llama3 8B)
 CHUNK_TARGET_TOKENS = 3000 # Target for each chunk in MapReduce
 CHUNK_OVERLAP_TOKENS = 150   # Overlap for chunks
@@ -20,8 +66,7 @@ if 'generated_summary' not in st.session_state:
     st.session_state.generated_summary = ""
 if 'summary_generated_once' not in st.session_state:
     st.session_state.summary_generated_once = False
-if 'app_theme_preference' not in st.session_state:
-    st.session_state.app_theme_preference = "Светлая"
+# 'app_theme_preference' session state initialization removed.
 if 'output_format_of_summary' not in st.session_state: # To store the format of the last generated summary
     st.session_state.output_format_of_summary = "Простой текст (text)"
 
@@ -35,6 +80,48 @@ USE_PLACEHOLDER_LLM = os.getenv("USE_PLACEHOLDER_LLM", "false").lower() == "true
 
 # --- LLM Interaction and Text Processing Functions ---
 
+def get_llm_system_prompt(summary_length_key: str, output_format_key: str, is_intermediate: bool) -> str:
+    if is_intermediate:
+        return ("Сгенерируй очень краткое, фактологическое саммари (1-2 предложения) следующего фрагмента текста. "
+                "Это саммари будет использовано для последующей агрегации. "
+                "Вывод должен быть только в формате простого текста (plain text).")
+
+    # Role and Task
+    base_prompt = (
+        "Ты – высококвалифицированный AI-ассистент, специализирующийся на создании кратких и развернутых саммари для различных текстов.\n"
+        "Твоя задача – внимательно прочитать предоставленный текст и сгенерировать его саммари в соответствии с указанными параметрами длины и формата вывода.\n"
+    )
+
+    # Summary Length Description
+    if "Краткое" in summary_length_key:
+        length_desc = '"Краткое саммари" (short): Требуется 2-3 ключевых предложения, передающих самую суть текста.'
+    elif "Развернутое" in summary_length_key:
+        length_desc = '"Развернутое саммари" (long): Требуется более подробный пересказ, охватывающий основные разделы или аргументы текста, обычно 1-2 абзаца.'
+    else:
+        length_desc = f"Длина саммари: {summary_length_key}."
+
+
+    # Output Format Description
+    if "Простой текст" in output_format_key:
+        format_desc = '"Простой текст (text)": Вывод должен быть представлен как простой текст без специального форматирования.'
+    elif "Markdown" in output_format_key:
+        format_desc = ('"Markdown (markdown)": Используй корректный Markdown-синтаксис (например, ## для заголовков, - или * для списков, **текст** или __текст__ для выделения), '
+                       'если это уместно для структуры и улучшения читаемости саммари.')
+    elif "HTML" in output_format_key:
+        format_desc = ('"HTML (html)": Используй базовые HTML-теги (например, `<p>` для абзацев, `<h2>` или `<h3>` для подзаголовков если необходимо выделить структуру, `<ul><li>` для списков, `<strong>` или `<em>` для выделения). '
+                       'Вывод НЕ должен содержать теги `<html>`, `<head>`, `<body>` или `<!DOCTYPE html>`. Только контентную часть.')
+    else:
+        format_desc = f"Формат вывода: {output_format_key}."
+
+    # Style and Language
+    style_prompt = (
+        "Стиль Саммари: Саммари должно быть связным, информативным, точным, без излишней \"воды\" и без выражения личного мнения. " # Escaped quote
+        "Оно должно объективно отражать содержание исходного текста.\n"
+        "Язык Ответа: Русский."
+    )
+
+    return f"{base_prompt}\nПараметры:\n1. {length_desc}\n2. {format_desc}\n\n{style_prompt}"
+
 try:
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except Exception:
@@ -45,66 +132,157 @@ def count_tokens(text: str) -> int:
         return len(text.split())
     return len(ENCODING.encode(text))
 
-def fetch_text_from_url(url: str) -> str:
+def fetch_text_from_url(url: str) -> Optional[str]:
+    """
+    Fetches text content as Markdown from a URL using the Crawl4AI API.
+    Uses httpx for the API call.
+    """
+    payload = {
+        "url": url,
+        "f": "fit",  # Filter Type: Adaptive content filtering
+        "q": None,   # Query: None
+        "c": "0"     # Cache Mode: Write-Only
+    }
+    # Start with base headers
+    headers = {"Content-Type": "application/json"}
+
+    # Check for optional Crawl4AI API Key
+    crawl4ai_api_key = os.getenv("CRAWL4AI_API_KEY")
+    if crawl4ai_api_key:
+        headers["Authorization"] = f"Bearer {crawl4ai_api_key}"
+        # Optional: print or log that an API key is being used for Crawl4AI
+        # print("DEBUG: Using CRAWL4AI_API_KEY for Crawl4AI request.")
+
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        for script_or_style in soup(["script", "style"]):
-            script_or_style.decompose()
-        text = soup.get_text(separator='\n', strip=True)
-        cleaned_text = "\n".join([line for line in text.splitlines() if line.strip()])
-        if not cleaned_text:
-            return "Ошибка: Не удалось извлечь основной текстовый контент со страницы."
-        return cleaned_text
-    except requests.exceptions.RequestException as e:
-        return f"Ошибка при запросе к URL: {e}"
+        # httpx is generally used with an explicit client for better resource management,
+        # but for a single call, httpx.post() is fine.
+        with httpx.Client(timeout=30.0) as client: # 30s timeout for API call
+            # Pass the potentially updated headers
+            response = client.post(CRAWL4AI_API_URL, headers=headers, json=payload)
+            response.raise_for_status()  # Raises an HTTPStatusError for bad responses (4XX or 5XX)
+
+        response_json = response.json()
+
+        if 'extracted_markdown' in response_json:
+            extracted_markdown = response_json['extracted_markdown']
+            if isinstance(extracted_markdown, str) and extracted_markdown.strip():
+                return extracted_markdown.strip()
+            else:
+                print("Crawl4AI returned empty or invalid 'extracted_markdown'.")
+                return None
+        else:
+            print(f"Crawl4AI API returned unexpected structure: {response_json.get('message', 'No message')}")
+            return None
+
+    except httpx.TimeoutException:
+        print(f"Timeout: Crawl4AI API ({CRAWL4AI_API_URL}) did not respond in time.")
+        return None
+    except httpx.RequestError as req_err:
+        print(f"Request Error: Could not connect to Crawl4AI API at {CRAWL4AI_API_URL}. Details: {req_err}")
+        return None
+    except httpx.HTTPStatusError as http_err:
+        print(f"HTTP Error: Crawl4AI API returned {http_err.response.status_code}. Response: {http_err.response.text[:200]}...")
+        return None
+    except json.JSONDecodeError:
+        # response object might not be available if client.post failed before response assigned
+        # For safety, access response.text only if response is confirmed to be an httpx.Response
+        error_response_text = "N/A"
+        if 'response' in locals() and isinstance(response, httpx.Response):
+            error_response_text = response.text[:200]
+        print(f"JSON Error: Could not decode response from Crawl4AI API. Response: {error_response_text}...")
+        return None
+    except KeyError:
+        # response_json should be available if KeyError occurs
+        error_response_json_text = "N/A"
+        if 'response_json' in locals():
+             error_response_json_text = json.dumps(response_json)[:200]
+        print(f"Key Error: 'extracted_markdown' field missing in Crawl4AI response. Response: {error_response_json_text}...")
+        return None
     except Exception as e:
-        return f"Ошибка при парсинге страницы: {e}"
+        print(f"Unexpected error while calling Crawl4AI API: {e}")
+        return None
 
+def clean_user_text(raw_text: str) -> str:
+    """
+    Cleans user-inputted text by removing HTML tags and normalizing whitespace.
+    """
+    if not raw_text or not raw_text.strip():
+        return ""
 
-def get_summary_from_llama(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str, is_intermediate_summary: bool = False) -> str:
-    if USE_PLACEHOLDER_LLM:
-        return (f"[ЗАГЛУШКА LLM{' (Промежуточный этап)' if is_intermediate_summary else ''}] "
-                f"Саммари для: '{text_to_summarize[:100]}...'. "
-                f"Длина: {summary_length}, Формат: {output_format}, Креативность: {creativity_level}")
+    # 1. Remove HTML tags using BeautifulSoup
+    soup = BeautifulSoup(raw_text, "html.parser")
+    text_without_html = soup.get_text(separator=" ") # Use space as separator to avoid mashing words
 
-    if not PROXY_WORKER_URL or not PROXY_MASTER_KEY:
-        return "Ошибка: URL прокси или API ключ не настроены в переменных окружения (PROXY_WORKER_URL, PROXY_MASTER_KEY)."
+    # 2. Normalize whitespace
+    # Replace multiple spaces/tabs with a single space
+    cleaned_text = re.sub(r'[ \t]+', ' ', text_without_html)
 
-    actual_summary_length = "short" if "Краткое" in summary_length or "этапа агрегации" in summary_length else "long"
+    # Reduce multiple newlines to a maximum of two
+    cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
 
-    actual_output_format = "text" # Default for intermediate summary
-    if not is_intermediate_summary: # Use user choice for final summary
-        if "Markdown" in output_format: actual_output_format = "markdown"
-        elif "HTML" in output_format: actual_output_format = "html"
+    # Replace \r\n (Windows line endings) with \n
+    cleaned_text = cleaned_text.replace('\r\n', '\n')
+    # Replace \r (old Mac line endings) with \n
+    cleaned_text = cleaned_text.replace('\r', '\n')
 
+    # Trim leading/trailing whitespace from the whole text
+    cleaned_text = cleaned_text.strip()
+
+    return cleaned_text
+
+def get_summary_from_llama(text_to_summarize: str, summary_length_ui: str, output_format_ui: str, creativity_level: str, selected_model_id: Optional[str], is_intermediate_summary: bool = False) -> str:
     temperature_map = {"Низкий": 0.2, "Средний": 0.5, "Высокий": 0.8}
     temperature = temperature_map.get(creativity_level, 0.5)
 
-    system_prompt = f"You are an expert summarizer. Your task is to generate a {actual_summary_length} summary of the provided text."
-    if is_intermediate_summary:
-        system_prompt = ("You are an expert summarizer. Generate a very concise summary of the following text chunk. "
-                         "This summary will be used as part of a map-reduce process to summarize a much larger document. "
-                         "Focus on extracting key facts and main ideas. The output MUST be in plain text format.")
-    else:
-        system_prompt += f" The output MUST be in {actual_output_format} format."
-        if actual_output_format == "markdown":
-            system_prompt += " Use appropriate Markdown syntax, including headings, lists, and emphasis where suitable."
-        elif actual_output_format == "html":
-            system_prompt += " Use appropriate HTML tags such as <p>, <h2>, <h3>, <ul>, <li>, and <strong> where suitable. Do not include <!DOCTYPE html>, <html>, <head>, or <body> tags, only the content itself."
-    system_prompt += " Ensure the summary is coherent, accurate, and captures the main points of the text."
+    # Initialize payload_to_send with temperature. Messages will be added after system prompt generation.
+    payload_to_send = {"temperature": temperature}
 
-    user_prompt = f"Please summarize the following text:\n\n{text_to_summarize}"
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-    payload = {"messages": messages, "temperature": temperature}
+    # --- Final Model Selection Logic ---
+    # Priority 1: UI selected placeholder (now modelId is "placeholder")
+    if selected_model_id == "placeholder": # Changed from "placeholder_true"
+        return (f"[ЗАГЛУШКА LLM{' (Промежуточный этап)' if is_intermediate_summary else ''}] "
+                f"Саммари для: '{text_to_summarize[:100]}...'. "
+                f"Модель: {selected_model_id}, Длина: {summary_length_ui}, Формат: {output_format_ui}, Креативность: {creativity_level}")
+
+    # Priority 2: UI selected real model ID
+    # A real model ID is expected to be a non-empty string and not "placeholder"
+    if selected_model_id and isinstance(selected_model_id, str) and selected_model_id.strip() and selected_model_id != "placeholder":
+        payload_to_send["model"] = selected_model_id
+        # Debug message for UI-selected real model
+        try:
+            st.markdown(f"<small><i>LLM DEBUG: Использование модели (из UI): {selected_model_id} через прокси.</i></small>", unsafe_allow_html=True)
+        except Exception:
+            print(f"LLM DEBUG: Attempting to use model (from UI): {selected_model_id} via proxy.")
+    # Priority 3: No valid model selected from UI (selected_model_id is None, empty, or an unexpected value)
+    else:
+        # This path is taken if selected_model_id is None, empty, or any value not caught above (e.g. not "placeholder" and not a valid string)
+        # USE_PLACEHOLDER_LLM from .env is now ignored for choosing a real model or forcing a placeholder if UI selection was expected.
+        return "Ошибка: Модель не выбрана или конфигурация моделей не загружена. Пожалуйста, проверьте models.json и выберите модель в UI."
+    # --- End Final Model Selection Logic ---
+
+    # Ensure PROXY_WORKER_URL and PROXY_MASTER_KEY are set if we are proceeding to an actual call
+    if not PROXY_WORKER_URL or not PROXY_MASTER_KEY:
+        # This error is now critical because if we reached here, it means a real model was selected (or intended to be).
+        return "Ошибка: URL прокси или API ключ не настроены для обращения к LLM (PROXY_WORKER_URL, PROXY_MASTER_KEY)."
+
+    # Generate the system prompt using the new helper function
+    system_prompt = get_llm_system_prompt(summary_length_ui, output_format_ui, is_intermediate_summary)
+
+    user_prompt = f"Пожалуйста, суммаризируй следующий текст:\n\n{text_to_summarize}"
+
+    payload_to_send["messages"] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    # The duplicated block was here. It has been removed.
+    # The correct logic for USE_PLACEHOLDER_LLM and credential checks
+    # is already present earlier in the function.
+
     headers = {"Authorization": f"Bearer {PROXY_MASTER_KEY}", "Content-Type": "application/json"}
 
     try:
-        response = requests.post(PROXY_WORKER_URL, headers=headers, json=payload, timeout=180)
+        response = requests.post(PROXY_WORKER_URL, headers=headers, json=payload_to_send, timeout=180)
         response.raise_for_status()
         result_json = response.json()
         if result_json.get("choices") and isinstance(result_json["choices"], list) and len(result_json["choices"]) > 0 and \
@@ -255,11 +433,8 @@ def main():
 
     with st.sidebar:
         st.subheader("Настройки")
-        theme_preference = st.radio("Предпочтение темы:", ("Светлая", "Темная"), key="app_theme_preference_radio", index=0 if st.session_state.app_theme_preference == "Светлая" else 1, on_change=lambda: st.experimental_rerun()) # Rerun on change for immediate (conceptual) effect
-        if theme_preference != st.session_state.app_theme_preference:
-            st.session_state.app_theme_preference = theme_preference
-        st.caption("Для изменения темы приложения (Светлая/Темная), используйте меню Streamlit (☰) -> Settings.")
-        st.caption(f"Текущее предпочтение: {st.session_state.app_theme_preference}")
+        # Theme switcher UI elements removed.
+        # Other settings could be added here in the future.
 
     tab1, tab2 = st.tabs(["Text Input", "URL Input"])
     text_input_val, url_input_val = "", "" # Initialize
@@ -271,32 +446,117 @@ def main():
     output_format_val = st.selectbox("Формат Вывода:", ("Простой текст (text)", "Markdown (markdown)", "HTML (html)"), key="output_format")
     creativity_level_val = st.select_slider("Уровень Креативности:", options=["Низкий", "Средний", "Высокий"], value="Средний", key="creativity_level")
 
+    # --- LLM Model Selection ---
+    if AVAILABLE_MODELS:
+        model_display_names = [m['displayName'] for m in AVAILABLE_MODELS]
+
+        # Initial default index for selectbox
+        try:
+            # Ensure session state has a valid default if it's somehow invalid or not in current list
+            if st.session_state.selected_model_display_name not in model_display_names:
+                st.session_state.selected_model_display_name = model_display_names[0] if model_display_names else DEFAULT_PLACEHOLDER_MODEL['displayName']
+
+            default_idx = model_display_names.index(st.session_state.selected_model_display_name)
+        except (ValueError, AttributeError):
+            default_idx = 0
+            if model_display_names:
+                 st.session_state.selected_model_display_name = model_display_names[default_idx]
+            else: # Should not happen if AVAILABLE_MODELS is properly populated with a default
+                 st.session_state.selected_model_display_name = DEFAULT_PLACEHOLDER_MODEL['displayName']
+
+        st.selectbox(
+            "Выберите Модель LLM:",
+            options=model_display_names,
+            index=default_idx,
+            key='selected_model_display_name' # Binds to st.session_state.selected_model_display_name
+        )
+    else:
+        # This case implies AVAILABLE_MODELS was empty, which load_models_config tries to prevent
+        st.error("Конфигурация моделей LLM не загружена или пуста. Проверьте файл models.json.")
+        # Provide a dummy value to prevent crashes, though load_models_config should give a default
+        st.session_state.selected_model_display_name = DEFAULT_PLACEHOLDER_MODEL['displayName']
+
+
     if st.button("Сгенерировать Саммари", key="generate_summary_button"):
         st.session_state.summary_generated_once = True
         st.session_state.output_format_of_summary = output_format_val # Store format for rendering/download
-        text_to_summarize_final = ""
+        text_to_summarize_final = "" # Initialize
 
-        if url_input_val:
+        # Determine active tab/input source
+        # This simple check prioritizes URL input if both have content.
+        # A more robust tab detection might be needed if Streamlit offers better native support for it.
+        if url_input_val: # User provided a URL
             with st.spinner(f"Извлечение текста из {url_input_val}..."):
-                text_to_summarize_final = fetch_text_from_url(url_input_val)
-            if text_to_summarize_final.startswith("Ошибка:"):
-                st.error(text_to_summarize_final); st.session_state.generated_summary = ""; return
-        elif text_input_val:
-            text_to_summarize_final = text_input_val
+                fetched_content = fetch_text_from_url(url_input_val)
+
+            if fetched_content is None or not fetched_content.strip():
+                st.error("Не удалось извлечь контент из указанного URL. Пожалуйста, проверьте ссылку или попробуйте другую.")
+                st.session_state.generated_summary = "" # Clear previous summary
+                return # Stop processing
+            text_to_summarize_final = fetched_content
+            st.markdown("<small><i>Контент извлечен из URL.</i></small>", unsafe_allow_html=True)
+
+        elif text_input_val: # User provided text directly
+            with st.spinner("Очистка введенного текста..."):
+                cleaned_text = clean_user_text(text_input_val)
+            text_to_summarize_final = cleaned_text
+            st.markdown("<small><i>Введенный текст очищен.</i></small>", unsafe_allow_html=True)
         else:
-            st.warning("Пожалуйста, введите текст или URL для суммаризации."); st.session_state.generated_summary = ""; st.session_state.summary_generated_once = False; return
+            st.warning("Пожалуйста, введите текст или URL для суммаризации.")
+            st.session_state.generated_summary = ""
+            st.session_state.summary_generated_once = False # Reset if no input
+            return
 
+        # Post-processing check for empty content
         if not text_to_summarize_final.strip():
-            st.warning("Извлеченный или введенный текст пуст. Нечего суммаризировать."); st.session_state.generated_summary = ""; return
+            st.warning("Нет текста для суммаризации после очистки или извлечения. Пожалуйста, проверьте введенные данные.")
+            st.session_state.generated_summary = ""
+            return
 
-        # Clear previous debug messages area if any
-        # (Not strictly necessary as new messages will overwrite, but good for cleanliness if we had a dedicated area)
+        # Clear previous debug messages area if any specific one exists
+        # For now, new st.markdown messages will appear below previous ones or overwrite if in st.empty
 
+        # --- Get selected model ID from UI choice ---
+        actual_model_id_to_use = None # Default to None (proxy will use its default)
+        selected_display_name = st.session_state.get('selected_model_display_name')
+
+        if selected_display_name and AVAILABLE_MODELS:
+            selected_model_obj = next((m for m in AVAILABLE_MODELS if m['displayName'] == selected_display_name), None)
+            if selected_model_obj:
+                actual_model_id_to_use = selected_model_obj['modelId']
+            else:
+                # This case might happen if session_state holds an old/invalid displayName
+                # Fallback to first available model's ID or None if list is somehow empty again
+                if AVAILABLE_MODELS and AVAILABLE_MODELS[0]['modelId'] != DEFAULT_PLACEHOLDER_MODEL['modelId']: # Check if first model is not the error placeholder
+                     actual_model_id_to_use = AVAILABLE_MODELS[0]['modelId']
+                     st.warning(f"Выбранное ранее имя модели '{selected_display_name}' не найдено. Используется модель по умолчанию: {AVAILABLE_MODELS[0]['displayName']}.")
+                     st.session_state.selected_model_display_name = AVAILABLE_MODELS[0]['displayName'] # Update session state
+                elif AVAILABLE_MODELS and len(AVAILABLE_MODELS) == 1 and AVAILABLE_MODELS[0]['modelId'] == DEFAULT_PLACEHOLDER_MODEL['modelId']:
+                     # Only the error placeholder model is available.
+                     actual_model_id_to_use = DEFAULT_PLACEHOLDER_MODEL['modelId']
+                     # st.info(f"Используется модель-заглушка из-за ошибки конфигурации: {DEFAULT_PLACEHOLDER_MODEL['displayName']}") # This info can be noisy here
+                else: # Should be prevented by earlier checks on AVAILABLE_MODELS loading
+                     st.error("Список моделей пуст или содержит только ошибку, невозможно определить ID модели.")
+                     st.session_state.generated_summary = "" # Clear summary and stop
+                     return # Cannot proceed
+
+        elif not AVAILABLE_MODELS : # Should be caught by UI selectbox loading, but as a safeguard
+            st.error("Список моделей не загружен. Проверьте models.json.")
+            st.session_state.generated_summary = "" # Clear summary and stop
+            return # Cannot proceed
+
+        # If selected_display_name is None (e.g. models.json failed and only placeholder exists)
+        # and that placeholder is selected, actual_model_id_to_use will be "placeholder_true"
+        if not selected_display_name and AVAILABLE_MODELS and len(AVAILABLE_MODELS) == 1 and AVAILABLE_MODELS[0]['modelId'] == DEFAULT_PLACEHOLDER_MODEL['modelId']:
+            actual_model_id_to_use = DEFAULT_PLACEHOLDER_MODEL['modelId']
+
+        # Call the summarization logic, now passing the selected model ID
         st.session_state.generated_summary = summarize_text_map_reduce(
             text_to_summarize_final,
             summary_length_val,
             output_format_val,
-            creativity_level_val
+            creativity_level_val,
+            actual_model_id_to_use # Pass the selected model ID
         )
         if st.session_state.generated_summary.startswith("Ошибка:"):
              st.error(st.session_state.generated_summary)

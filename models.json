@@ -1,0 +1,20 @@
+[
+  {
+    "displayName": "Llama 3.3 70B Instruct (Fast FP8)",
+    "modelId": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "provider": "Cloudflare AI",
+    "notes": "Мощная модель, быстрая версия с FP8 квантованием."
+  },
+  {
+    "displayName": "Llama 3 8B Instruct",
+    "modelId": "@cf/meta/llama-3-8b-instruct",
+    "provider": "Cloudflare AI",
+    "notes": "Более компактная версия Llama 3 Instruct."
+  },
+  {
+    "displayName": "ЗАГЛУШКА (Тест UI)",
+    "modelId": "placeholder",
+    "provider": "Local",
+    "notes": "Использует заглушку, не делает реальный вызов LLM."
+  }
+]
