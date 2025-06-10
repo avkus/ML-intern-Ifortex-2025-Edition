@@ -24,8 +24,7 @@ if 'generated_summary' not in st.session_state:
     st.session_state.generated_summary = ""
 if 'summary_generated_once' not in st.session_state:
     st.session_state.summary_generated_once = False
-if 'app_theme_preference' not in st.session_state:
-    st.session_state.app_theme_preference = "Светлая"
+# 'app_theme_preference' session state initialization removed.
 if 'output_format_of_summary' not in st.session_state: # To store the format of the last generated summary
     st.session_state.output_format_of_summary = "Простой текст (text)"
 
@@ -38,6 +37,48 @@ USE_PLACEHOLDER_LLM = os.getenv("USE_PLACEHOLDER_LLM", "false").lower() == "true
 
 
 # --- LLM Interaction and Text Processing Functions ---
+
+def get_llm_system_prompt(summary_length_key: str, output_format_key: str, is_intermediate: bool) -> str:
+    if is_intermediate:
+        return ("Сгенерируй очень краткое, фактологическое саммари (1-2 предложения) следующего фрагмента текста. "
+                "Это саммари будет использовано для последующей агрегации. "
+                "Вывод должен быть только в формате простого текста (plain text).")
+
+    # Role and Task
+    base_prompt = (
+        "Ты – высококвалифицированный AI-ассистент, специализирующийся на создании кратких и развернутых саммари для различных текстов.\n"
+        "Твоя задача – внимательно прочитать предоставленный текст и сгенерировать его саммари в соответствии с указанными параметрами длины и формата вывода.\n"
+    )
+
+    # Summary Length Description
+    if "Краткое" in summary_length_key:
+        length_desc = '"Краткое саммари" (short): Требуется 2-3 ключевых предложения, передающих самую суть текста.'
+    elif "Развернутое" in summary_length_key:
+        length_desc = '"Развернутое саммари" (long): Требуется более подробный пересказ, охватывающий основные разделы или аргументы текста, обычно 1-2 абзаца.'
+    else:
+        length_desc = f"Длина саммари: {summary_length_key}."
+
+
+    # Output Format Description
+    if "Простой текст" in output_format_key:
+        format_desc = '"Простой текст (text)": Вывод должен быть представлен как простой текст без специального форматирования.'
+    elif "Markdown" in output_format_key:
+        format_desc = ('"Markdown (markdown)": Используй корректный Markdown-синтаксис (например, ## для заголовков, - или * для списков, **текст** или __текст__ для выделения), '
+                       'если это уместно для структуры и улучшения читаемости саммари.')
+    elif "HTML" in output_format_key:
+        format_desc = ('"HTML (html)": Используй базовые HTML-теги (например, `<p>` для абзацев, `<h2>` или `<h3>` для подзаголовков если необходимо выделить структуру, `<ul><li>` для списков, `<strong>` или `<em>` для выделения). '
+                       'Вывод НЕ должен содержать теги `<html>`, `<head>`, `<body>` или `<!DOCTYPE html>`. Только контентную часть.')
+    else:
+        format_desc = f"Формат вывода: {output_format_key}."
+
+    # Style and Language
+    style_prompt = (
+        "Стиль Саммари: Саммари должно быть связным, информативным, точным, без излишней \"воды\" и без выражения личного мнения. " # Escaped quote
+        "Оно должно объективно отражать содержание исходного текста.\n"
+        "Язык Ответа: Русский."
+    )
+
+    return f"{base_prompt}\nПараметры:\n1. {length_desc}\n2. {format_desc}\n\n{style_prompt}"
 
 try:
     ENCODING = tiktoken.get_encoding("cl100k_base")
@@ -60,12 +101,21 @@ def fetch_text_from_url(url: str) -> Optional[str]:
         "q": None,   # Query: None
         "c": "0"     # Cache Mode: Write-Only
     }
+    # Start with base headers
     headers = {"Content-Type": "application/json"}
+
+    # Check for optional Crawl4AI API Key
+    crawl4ai_api_key = os.getenv("CRAWL4AI_API_KEY")
+    if crawl4ai_api_key:
+        headers["Authorization"] = f"Bearer {crawl4ai_api_key}"
+        # Optional: print or log that an API key is being used for Crawl4AI
+        # print("DEBUG: Using CRAWL4AI_API_KEY for Crawl4AI request.")
 
     try:
         # httpx is generally used with an explicit client for better resource management,
         # but for a single call, httpx.post() is fine.
         with httpx.Client(timeout=30.0) as client: # 30s timeout for API call
+            # Pass the potentially updated headers
             response = client.post(CRAWL4AI_API_URL, headers=headers, json=payload)
             response.raise_for_status()  # Raises an HTTPStatusError for bad responses (4XX or 5XX)
 
@@ -138,45 +188,53 @@ def clean_user_text(raw_text: str) -> str:
 
     return cleaned_text
 
-def get_summary_from_llama(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str, is_intermediate_summary: bool = False) -> str:
-    if USE_PLACEHOLDER_LLM:
-        return (f"[ЗАГЛУШКА LLM{' (Промежуточный этап)' if is_intermediate_summary else ''}] "
-                f"Саммари для: '{text_to_summarize[:100]}...'. "
-                f"Длина: {summary_length}, Формат: {output_format}, Креативность: {creativity_level}")
-
-    if not PROXY_WORKER_URL or not PROXY_MASTER_KEY:
-        return "Ошибка: URL прокси или API ключ не настроены в переменных окружения (PROXY_WORKER_URL, PROXY_MASTER_KEY)."
-
-    actual_summary_length = "short" if "Краткое" in summary_length or "этапа агрегации" in summary_length else "long"
-
-    actual_output_format = "text" # Default for intermediate summary
-    if not is_intermediate_summary: # Use user choice for final summary
-        if "Markdown" in output_format: actual_output_format = "markdown"
-        elif "HTML" in output_format: actual_output_format = "html"
-
+def get_summary_from_llama(text_to_summarize: str, summary_length_ui: str, output_format_ui: str, creativity_level: str, is_intermediate_summary: bool = False) -> str:
     temperature_map = {"Низкий": 0.2, "Средний": 0.5, "Высокий": 0.8}
     temperature = temperature_map.get(creativity_level, 0.5)
 
-    system_prompt = f"You are an expert summarizer. Your task is to generate a {actual_summary_length} summary of the provided text."
-    if is_intermediate_summary:
-        system_prompt = ("You are an expert summarizer. Generate a very concise summary of the following text chunk. "
-                         "This summary will be used as part of a map-reduce process to summarize a much larger document. "
-                         "Focus on extracting key facts and main ideas. The output MUST be in plain text format.")
-    else:
-        system_prompt += f" The output MUST be in {actual_output_format} format."
-        if actual_output_format == "markdown":
-            system_prompt += " Use appropriate Markdown syntax, including headings, lists, and emphasis where suitable."
-        elif actual_output_format == "html":
-            system_prompt += " Use appropriate HTML tags such as <p>, <h2>, <h3>, <ul>, <li>, and <strong> where suitable. Do not include <!DOCTYPE html>, <html>, <head>, or <body> tags, only the content itself."
-    system_prompt += " Ensure the summary is coherent, accurate, and captures the main points of the text."
+    # Initialize payload_to_send with temperature. Messages will be added after system prompt generation.
+    payload_to_send = {
+        "temperature": temperature
+    }
 
-    user_prompt = f"Please summarize the following text:\n\n{text_to_summarize}"
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-    payload = {"messages": messages, "temperature": temperature}
+    use_placeholder_env_value = os.getenv("USE_PLACEHOLDER_LLM", "")
+
+    # Handle "true" placeholder case first
+    if use_placeholder_env_value.lower() == "true":
+        return (f"[ЗАГЛУШКА LLM{' (Промежуточный этап)' if is_intermediate_summary else ''}] "
+                f"Саммари для: '{text_to_summarize[:100]}...'. "
+                f"Длина: {summary_length_ui}, Формат: {output_format_ui}, Креативность: {creativity_level}")
+
+    # If not "true", then it's either a model string or we proceed to actual call
+    if use_placeholder_env_value.startswith("@cf/"):
+        payload_to_send["model"] = use_placeholder_env_value
+        try:
+            st.markdown(f"<small><i>LLM DEBUG: Использование модели: {use_placeholder_env_value} через прокси.</i></small>", unsafe_allow_html=True)
+        except Exception:
+            print(f"LLM DEBUG: Attempting to use model via proxy: {use_placeholder_env_value}")
+
+    # Now, check for necessary credentials for actual API call
+    if not PROXY_WORKER_URL or not PROXY_MASTER_KEY:
+        return "Ошибка: URL прокси или API ключ не настроены для обращения к LLM (PROXY_WORKER_URL, PROXY_MASTER_KEY)."
+
+    # Generate the system prompt using the new helper function
+    system_prompt = get_llm_system_prompt(summary_length_ui, output_format_ui, is_intermediate_summary)
+
+    user_prompt = f"Пожалуйста, суммаризируй следующий текст:\n\n{text_to_summarize}"
+
+    payload_to_send["messages"] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    # The duplicated block was here. It has been removed.
+    # The correct logic for USE_PLACEHOLDER_LLM and credential checks
+    # is already present earlier in the function.
+
     headers = {"Authorization": f"Bearer {PROXY_MASTER_KEY}", "Content-Type": "application/json"}
 
     try:
-        response = requests.post(PROXY_WORKER_URL, headers=headers, json=payload, timeout=180)
+        response = requests.post(PROXY_WORKER_URL, headers=headers, json=payload_to_send, timeout=180)
         response.raise_for_status()
         result_json = response.json()
         if result_json.get("choices") and isinstance(result_json["choices"], list) and len(result_json["choices"]) > 0 and \
@@ -327,11 +385,8 @@ def main():
 
     with st.sidebar:
         st.subheader("Настройки")
-        theme_preference = st.radio("Предпочтение темы:", ("Светлая", "Темная"), key="app_theme_preference_radio", index=0 if st.session_state.app_theme_preference == "Светлая" else 1, on_change=lambda: st.experimental_rerun()) # Rerun on change for immediate (conceptual) effect
-        if theme_preference != st.session_state.app_theme_preference:
-            st.session_state.app_theme_preference = theme_preference
-        st.caption("Для изменения темы приложения (Светлая/Темная), используйте меню Streamlit (☰) -> Settings.")
-        st.caption(f"Текущее предпочтение: {st.session_state.app_theme_preference}")
+        # Theme switcher UI elements removed.
+        # Other settings could be added here in the future.
 
     tab1, tab2 = st.tabs(["Text Input", "URL Input"])
     text_input_val, url_input_val = "", "" # Initialize
