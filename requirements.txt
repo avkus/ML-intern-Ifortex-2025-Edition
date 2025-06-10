@@ -3,5 +3,5 @@ requests
 beautifulsoup4
 tiktoken
 python-dotenv
-crawler4ai
+crawl4ai
 playwright

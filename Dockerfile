@@ -11,13 +11,6 @@ COPY requirements.txt .
 # Using --no-cache-dir to reduce layer size
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers and dependencies
-RUN python -m playwright install --with-deps chromium
-
-# Run crawl4ai setup (if it requires any specific setup steps post-installation)
-# This command might download models or perform other initializations.
-RUN crawl4ai-setup
-
 # Optional: Run crawl4ai-doctor to verify the installation during build
 # This can be useful for debugging but might be removed for a leaner final image.
 # RUN crawl4ai-doctor

@@ -1,3 +1,8 @@
+import sys
+# import asyncio  # Удалено
+if sys.platform.startswith("win"):
+    # asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    pass
 import streamlit as st
 import requests # Used by get_summary_from_llama
 from bs4 import BeautifulSoup # Still needed for clean_user_text (if any, or general parsing)
@@ -7,8 +12,11 @@ import tiktoken
 from dotenv import load_dotenv
 from typing import Optional # For the return type
 import re # For clean_user_text
-import asyncio # Added
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode # Added
+# import asyncio # Added
+# from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode # Added
+import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
 
 # Load environment variables from .env file if it exists
 # This should be one of the first things to run
@@ -78,53 +86,49 @@ PROXY_MASTER_KEY = os.getenv("PROXY_MASTER_KEY")
 # For local testing without real LLM, set USE_PLACEHOLDER_LLM="true" as env var
 USE_PLACEHOLDER_LLM = os.getenv("USE_PLACEHOLDER_LLM", "false").lower() == "true"
 
+# --- ThreadPoolExecutor for async crawling workaround on Windows ---
+# thread_pool_executor = ThreadPoolExecutor(max_workers=2)  # Удалено
 
 # --- LLM Interaction and Text Processing Functions ---
 
-async def _run_crawler(target_url: str) -> str:
-    """
-    Asynchronously runs the AsyncWebCrawler to fetch and extract content from a URL.
-    Returns the extracted markdown or an error message string.
-    """
-    # print(f"DEBUG: _run_crawler called for URL: {target_url}") # For debugging if needed
-    browser_conf = BrowserConfig(
-        headless=True
-        # user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..." # Example if needed
-    )
-    run_conf = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS
-    )
+# Удалены: async def _run_crawler, async def _run_crawler_async_part
 
+import requests  # Уже импортирован выше, оставляем для явности
+
+def fetch_text_from_url(url: str) -> Optional[str]:
+    """
+    Делает POST-запрос к FastAPI-сервису crawl4ai_service для извлечения markdown-контента по URL.
+    Возвращает строку markdown или None/ошибку.
+    """
+    if not url or not url.strip():
+        return None
+    api_url = "http://crawl4ai_service:8000/scrape/"
     try:
-        async with AsyncWebCrawler(config=browser_conf) as crawler:
-            # print(f"DEBUG: AsyncWebCrawler initialized. Calling arun for {target_url}")
-            result = await crawler.arun(
-                url=target_url,
-                config=run_conf
-            )
-            # print(f"DEBUG: arun completed. Result: {type(result)}")
-            # if result:
-            #     print(f"DEBUG: Result fields: markdown={hasattr(result, 'markdown')}, error_message={hasattr(result, 'error_message')}")
-
-        if result and hasattr(result, 'markdown') and result.markdown and isinstance(result.markdown, str):
-            # print("DEBUG: Markdown content found.")
-            return result.markdown.strip()
-        elif result and hasattr(result, 'error_message') and result.error_message:
-            # print(f"DEBUG: Crawl4AI error_message: {result.error_message}")
-            return f"Ошибка от Crawl4AI: {result.error_message}"
+        response = requests.post(api_url, json={"url": url}, timeout=90)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "success" and data.get("extracted_markdown"):
+            return data["extracted_markdown"].strip()
         else:
-            # print("DEBUG: Crawl4AI returned unexpected result or no content.")
-            return "Ошибка: Crawl4AI не вернул контент или вернул неожиданный результат."
-
+            print(f"Crawl4ai_service API error: {data.get('error_detail', 'Unknown error')}")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"HTTP error when calling crawl4ai_service: {e}")
+        return None
     except Exception as e:
-        # print(f"DEBUG: Exception in _run_crawler: {e}")
-        return f"Внутренняя ошибка при выполнении _run_crawler: {e}"
+        print(f"Unexpected error in fetch_text_from_url: {e}")
+        return None
 
 def get_llm_system_prompt(summary_length_key: str, output_format_key: str, is_intermediate: bool) -> str:
     if is_intermediate:
-        return ("Сгенерируй очень краткое, фактологическое саммари (1-2 предложения) следующего фрагмента текста. "
-                "Это саммари будет использовано для последующей агрегации. "
-                "Вывод должен быть только в формате простого текста (plain text).")
+        return (
+            "ROLE: You are an information extraction tool.\n"
+            "TASK: Analyze the provided text chunk. Your goal is to extract a few key phrases or 1-2 very short sentences in RUSSIAN that represent the main topics or entities in this chunk. This will be used for later aggregation. Focus on factual data.\n"
+            "OUTPUT_FORMAT: CRITICAL: Output MUST be plain text ONLY. Do NOT use any Markdown formatting (no headings, no lists, no bold, no italics, no links). Just plain text sentences.\n"
+            "LANGUAGE: Generate the output in RUSSIAN, regardless of the input chunk's language.\n"
+            "IF_NO_CONTENT_RULE: If the chunk consists mostly of code, navigation links, highly fragmented data, or contains no clear narrative/summarizable information, respond with the exact phrase: 'НЕТ_ДАННЫХ_ДЛЯ_САММАРИ'\n"
+            "AVOID: Do not add any conversational fluff, introductions like 'Here is the summary:', or any text not directly related to the extracted key phrases/sentences."
+        )
 
     # Role and Task
     base_prompt = (
@@ -172,58 +176,6 @@ def count_tokens(text: str) -> int:
         return len(text.split())
     return len(ENCODING.encode(text))
 
-def fetch_text_from_url(url: str) -> Optional[str]:
-    """
-    Fetches text content as Markdown from a URL using the crawler4ai library.
-    This function is synchronous and uses asyncio.run() to call the async helper.
-    Returns extracted markdown string on success, None on failure.
-    """
-    if not url or not url.strip():
-        # print("DEBUG: fetch_text_from_url called with empty or invalid URL.") # For debugging
-        return None # Or perhaps an error string specific to invalid input URL
-
-    # print(f"DEBUG: fetch_text_from_url attempting to run crawler for: {url}") # For debugging
-    try:
-        # Ensure an event loop exists or can be created by asyncio.run()
-        # In some environments (like certain threads without an active loop),
-        # asyncio.run() might need specific setup or alternatives.
-        # However, for typical Streamlit app execution, asyncio.run() should be fine.
-        extracted_content = asyncio.run(_run_crawler(url))
-
-        # print(f"DEBUG: _run_crawler returned: '{extracted_content[:100]}...'") # For debugging
-
-        if extracted_content.startswith("Ошибка:") or extracted_content.startswith("Внутренняя ошибка при выполнении"):
-            print(f"Error during crawling URL '{url}': {extracted_content}") # Log the specific error from _run_crawler
-            return None
-
-        if not extracted_content.strip(): # Check if crawler returned empty string after stripping
-            print(f"Warning: Crawl4AI returned empty content for URL '{url}'.")
-            return None
-
-        return extracted_content
-
-    except RuntimeError as e:
-        # Catch specific RuntimeError that asyncio.run() might raise if it's called
-        # from a thread that cannot manage a new event loop, or if an event loop is already running.
-        # This is more common in complex threaded/async environments.
-        if "cannot be called when another asyncio event loop is running" in str(e) or \
-           "There is no current event loop in thread" in str(e):
-            print(f"ERROR: asyncio.run() conflict in fetch_text_from_url for '{url}': {e}. "
-                  "This might indicate an issue with Streamlit's threading model or how asyncio is used globally. "
-                  "Consider using nest_asyncio if this is a persistent problem in a notebook-like environment, "
-                  "or structuring async calls differently for Streamlit.")
-            # For a Streamlit app, this error should ideally not occur if Streamlit manages its threads simply.
-            # Fallback to returning None.
-            return None
-        else:
-            # Other RuntimeErrors
-            print(f"ERROR: A RuntimeError occurred in fetch_text_from_url for '{url}': {e}")
-            return None
-    except Exception as e:
-        # Catch any other general exception during the asyncio.run call or subsequent processing
-        print(f"ERROR: An unexpected error occurred in fetch_text_from_url for '{url}': {e}")
-        return None
-
 def clean_user_text(raw_text: str) -> str:
     """
     Cleans user-inputted text by removing HTML tags and normalizing whitespace.
@@ -260,57 +212,56 @@ def get_summary_from_llama(text_to_summarize: str, summary_length_ui: str, outpu
     payload_to_send = {"temperature": temperature}
 
     # --- Final Model Selection Logic ---
-    # Priority 1: UI selected placeholder (now modelId is "placeholder")
-    if selected_model_id == "placeholder": # Changed from "placeholder_true"
+    if selected_model_id == "placeholder":
         return (f"[ЗАГЛУШКА LLM{' (Промежуточный этап)' if is_intermediate_summary else ''}] "
                 f"Саммари для: '{text_to_summarize[:100]}...'. "
                 f"Модель: {selected_model_id}, Длина: {summary_length_ui}, Формат: {output_format_ui}, Креативность: {creativity_level}")
 
-    # Priority 2: UI selected real model ID
-    # A real model ID is expected to be a non-empty string and not "placeholder"
     if selected_model_id and isinstance(selected_model_id, str) and selected_model_id.strip() and selected_model_id != "placeholder":
         payload_to_send["model"] = selected_model_id
-        # Debug message for UI-selected real model
         try:
             st.markdown(f"<small><i>LLM DEBUG: Использование модели (из UI): {selected_model_id} через прокси.</i></small>", unsafe_allow_html=True)
         except Exception:
             print(f"LLM DEBUG: Attempting to use model (from UI): {selected_model_id} via proxy.")
-    # Priority 3: No valid model selected from UI (selected_model_id is None, empty, or an unexpected value)
     else:
-        # This path is taken if selected_model_id is None, empty, or any value not caught above (e.g. not "placeholder" and not a valid string)
-        # USE_PLACEHOLDER_LLM from .env is now ignored for choosing a real model or forcing a placeholder if UI selection was expected.
         return "Ошибка: Модель не выбрана или конфигурация моделей не загружена. Пожалуйста, проверьте models.json и выберите модель в UI."
-    # --- End Final Model Selection Logic ---
 
-    # Ensure PROXY_WORKER_URL and PROXY_MASTER_KEY are set if we are proceeding to an actual call
     if not PROXY_WORKER_URL or not PROXY_MASTER_KEY:
-        # This error is now critical because if we reached here, it means a real model was selected (or intended to be).
         return "Ошибка: URL прокси или API ключ не настроены для обращения к LLM (PROXY_WORKER_URL, PROXY_MASTER_KEY)."
 
-    # Generate the system prompt using the new helper function
     system_prompt = get_llm_system_prompt(summary_length_ui, output_format_ui, is_intermediate_summary)
-
     user_prompt = f"Пожалуйста, суммаризируй следующий текст:\n\n{text_to_summarize}"
-
     payload_to_send["messages"] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ]
 
-    # The duplicated block was here. It has been removed.
-    # The correct logic for USE_PLACEHOLDER_LLM and credential checks
-    # is already present earlier in the function.
-
     headers = {"Authorization": f"Bearer {PROXY_MASTER_KEY}", "Content-Type": "application/json"}
+
+    # === Логирование payload ===
+    try:
+        print(f"DEBUG: Payload to send to proxy for model {selected_model_id}:\n{json.dumps(payload_to_send, indent=2, ensure_ascii=False)}")
+    except Exception as e:
+        print(f"DEBUG: Ошибка при логировании payload: {e}")
 
     try:
         response = requests.post(PROXY_WORKER_URL, headers=headers, json=payload_to_send, timeout=180)
         response.raise_for_status()
+        # === Логирование сырого ответа ===
+        try:
+            print(f"DEBUG: Raw response text from proxy:\n{response.text}")
+        except Exception as e:
+            print(f"DEBUG: Ошибка при логировании response.text: {e}")
         result_json = response.json()
+        # === Логирование распарсенного JSON ===
+        try:
+            print(f"DEBUG: Parsed JSON response from proxy:\n{json.dumps(result_json, indent=2, ensure_ascii=False)}")
+        except Exception as e:
+            print(f"DEBUG: Ошибка при логировании result_json: {e}")
         if result_json.get("choices") and isinstance(result_json["choices"], list) and len(result_json["choices"]) > 0 and \
            result_json["choices"][0].get("message") and result_json["choices"][0]["message"].get("content"):
             return result_json["choices"][0]["message"]["content"].strip()
-        else: # Fallbacks for different possible proxy response structures
+        else:
             if result_json.get("response") and result_json["response"].get("content"): return result_json["response"]["content"].strip()
             if result_json.get("result") and result_json["result"].get("summary"): return result_json["result"]["summary"].strip()
             return f"Ошибка: Неожиданный формат ответа от LLM прокси: {json.dumps(result_json)}"
@@ -325,71 +276,80 @@ def get_summary_from_llama(text_to_summarize: str, summary_length_ui: str, outpu
 
 
 def text_splitter_intelligent(text: str, target_chunk_tokens: int, overlap_tokens: int) -> list[str]:
+    MIN_PROGRESS_TOKENS = 100  # Минимальный гарантированный сдвиг по токенам
     if ENCODING is None:
         words = text.split()
         estimated_words_per_chunk = target_chunk_tokens
-        chunks = [" ".join(words[i:i + estimated_words_per_chunk]) for i in range(0, len(words), estimated_words_per_chunk - overlap_tokens if estimated_words_per_chunk > overlap_tokens else estimated_words_per_chunk)]
-        return [chunk for chunk in chunks if chunk.strip()]
+        chunks = [" ".join(words[i:i + estimated_words_per_chunk]) for i in range(0, len(words), max(MIN_PROGRESS_TOKENS, estimated_words_per_chunk - overlap_tokens if estimated_words_per_chunk > overlap_tokens else estimated_words_per_chunk))]
+        return [chunk for chunk in chunks if len(chunk.strip()) > 10 and len(chunk.split()) > 20]
 
     tokens = ENCODING.encode(text)
-    if not tokens: return []
+    if not tokens:
+        return []
 
     chunks = []
     current_pos = 0
-    while current_pos < len(tokens):
-        end_pos = min(current_pos + target_chunk_tokens, len(tokens))
+    text_len = len(tokens)
+    while current_pos < text_len:
+        # 1. Предлагаемая граница чанка
+        end_pos = min(current_pos + target_chunk_tokens, text_len)
         chunk_text = ENCODING.decode(tokens[current_pos:end_pos])
+        # 2. Интеллектуальное обрезание по абзацу/предложению
+        smart_end = None
+        # Поиск границы абзаца (\n\n) в последней трети чанка
+        para_split_index = chunk_text.rfind("\n\n", int(len(chunk_text) * 0.5))
+        if para_split_index != -1 and para_split_index > int(len(chunk_text) * 0.3):
+            smart_end = para_split_index + 2
+        else:
+            # Поиск конца предложения в последней трети чанка
+            sent_split_chars = ['.', '!', '?']
+            best_sent_idx = -1
+            for i in range(len(chunk_text) - 1, int(len(chunk_text) * 0.3) - 1, -1):
+                if chunk_text[i] in sent_split_chars:
+                    if i + 1 < len(chunk_text) and chunk_text[i+1].isspace():
+                        best_sent_idx = i + 1
+                        break
+                    elif i + 1 == len(chunk_text):
+                        best_sent_idx = i + 1
+                        break
+            if best_sent_idx != -1:
+                smart_end = best_sent_idx
+        # 3. Если "умная" граница найдена и чанк не слишком короткий, используем её
+        if smart_end is not None:
+            smart_chunk = chunk_text[:smart_end]
+            smart_chunk_tokens = ENCODING.encode(smart_chunk)
+            # Если "умный" чанк слишком короткий (<50% target), пробуем добрать до target_chunk_tokens
+            if len(smart_chunk_tokens) < target_chunk_tokens * 0.5:
+                # Принудительно берем до target_chunk_tokens
+                smart_chunk = chunk_text
+                smart_chunk_tokens = ENCODING.encode(smart_chunk)
+            chunk_text = smart_chunk
+        # 4. Обрезаем чанк, если он вдруг получился больше target_chunk_tokens
+        chunk_tokens = ENCODING.encode(chunk_text)
+        if len(chunk_tokens) > target_chunk_tokens:
+            chunk_tokens = chunk_tokens[:target_chunk_tokens]
+            chunk_text = ENCODING.decode(chunk_tokens)
+        # 5. Добавляем чанк, если он не слишком короткий
+        if count_tokens(chunk_text) > 20 and len(chunk_text.strip()) > 10:
+            chunks.append(chunk_text)
+        # 6. Гарантированный сдвиг
+        progress = max(MIN_PROGRESS_TOKENS, len(chunk_tokens) - overlap_tokens)
+        if progress < 1:
+            progress = MIN_PROGRESS_TOKENS
+        current_pos += progress
+        # Защита от зацикливания
+        if current_pos <= 0 or current_pos >= text_len:
+            break
+    return chunks
 
-        actual_end_pos_in_text = len(chunk_text)
 
-        if end_pos < len(tokens): # If not the last chunk, try to split intelligently
-            # Try to find paragraph split (double newline) in the latter part of the chunk
-            para_split_index = chunk_text.rfind("\n\n", int(len(chunk_text) * 0.7))
-            if para_split_index != -1:
-                actual_end_pos_in_text = para_split_index + 2 # Include the \n\n
-            else:
-                # Try sentence split in the latter part of the chunk
-                sent_split_chars = ['.', '!', '?']
-                best_sent_idx = -1
-                # Search backwards from end for a sentence boundary in the last half or so
-                for i in range(len(chunk_text) - 1, int(len(chunk_text) * 0.5) -1, -1):
-                    if chunk_text[i] in sent_split_chars:
-                        if i + 1 < len(chunk_text) and chunk_text[i+1].isspace(): # Ensure it's followed by space or is at end
-                            best_sent_idx = i + 1
-                            break
-                        elif i + 1 == len(chunk_text): # End of chunk is a boundary
-                            best_sent_idx = i + 1
-                            break
-                if best_sent_idx != -1:
-                    actual_end_pos_in_text = best_sent_idx
-
-            chunk_text = chunk_text[:actual_end_pos_in_text]
-
-        # Re-encode the potentially modified chunk to get its true new token length for overlap calculation
-        final_chunk_tokens = ENCODING.encode(chunk_text)
-        chunks.append(chunk_text)
-
-        # Calculate next starting position with overlap
-        # Overlap should be less than the current chunk's token length
-        actual_overlap_tokens = min(overlap_tokens, len(final_chunk_tokens) -1 if len(final_chunk_tokens) > 0 else 0)
-        current_pos += len(final_chunk_tokens) - actual_overlap_tokens
-
-        # Ensure progress, if overlap is too large or chunk is too small
-        if len(final_chunk_tokens) == 0: # Avoid infinite loop on empty chunk
-             current_pos = end_pos # Should not happen with proper text, but as safeguard
-        elif current_pos <= (end_pos - len(final_chunk_tokens)): # if next start is before or at current chunk's start
-             current_pos = end_pos # force move to end of original chunk window
-
-    return [chunk for chunk in chunks if count_tokens(chunk) > overlap_tokens / 4 and len(chunk.strip()) > 10]
-
-
-def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str, selected_model_id: Optional[str]) -> str:
+def summarize_text_map_reduce(text_to_summarize: str, summary_length_ui: str, output_format_ui: str, creativity_level: str, selected_model_id: Optional[str]) -> str:
     total_tokens = count_tokens(text_to_summarize)
     st.markdown(f"<small><i>Отладочная информация: Общее количество токенов: {total_tokens}</i></small>", unsafe_allow_html=True)
 
     if total_tokens <= TOKEN_THRESHOLD:
         st.markdown("<small><i>Отладочная информация: Текст короткий, используется прямое суммирование.</i></small>", unsafe_allow_html=True)
-        return get_summary_from_llama(text_to_summarize, summary_length, output_format, creativity_level, selected_model_id)
+        return get_summary_from_llama(text_to_summarize, summary_length_ui=summary_length_ui, output_format_ui=output_format_ui, creativity_level=creativity_level, selected_model_id=selected_model_id)
 
     st.markdown(f"<small><i>Отладочная информация: Текст длинный ({total_tokens} токенов), используется MapReduce.</i></small>", unsafe_allow_html=True)
     chunks = text_splitter_intelligent(text_to_summarize, CHUNK_TARGET_TOKENS, CHUNK_OVERLAP_TOKENS)
@@ -401,18 +361,51 @@ def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, outpu
     progress_bar = st.progress(0)
     for i, chunk in enumerate(chunks):
         chunk_token_count = count_tokens(chunk)
-        # st.markdown(f"<small><i>Отладочная информация: Суммаризация чанка {i+1}/{len(chunks)} ({chunk_token_count} токенов)...</i></small>", unsafe_allow_html=True)
         status_text = st.empty()
         status_text.markdown(f"<small><i>Суммаризация чанка {i+1}/{len(chunks)} ({chunk_token_count} токенов)...</i></small>", unsafe_allow_html=True)
 
+        # --- Логирование для отладки ---
+        with st.expander(f"Отладка Чанка {i+1}/{len(chunks)}", expanded=False):
+            st.write("**Текст чанка:**")
+            st.code(chunk)
+            system_prompt = get_llm_system_prompt(
+                summary_length_key="Краткое саммари для этапа агрегации",
+                output_format_key="Простой текст (text)",
+                is_intermediate=True
+            )
+            st.write("**System Prompt:**")
+            st.code(system_prompt)
+            user_prompt = f"Пожалуйста, суммаризируй следующий текст:\n\n{chunk}"
+            st.write("**User Prompt:**")
+            st.code(user_prompt)
+            payload_to_send = {
+                "temperature": 0.2,
+                "model": selected_model_id,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            }
+            st.write("**Payload to send:**")
+            st.code(payload_to_send)
+
+        print(f"[DEBUG] Chunk {i+1}/{len(chunks)}")
+        print("[DEBUG] System Prompt:\n", system_prompt)
+        print("[DEBUG] User Prompt:\n", user_prompt)
+        print("[DEBUG] Payload:", payload_to_send)
+        print("[DEBUG] Chunk text:\n", chunk)
+
         intermediate_summary = get_summary_from_llama(
             chunk,
-            summary_length="Краткое саммари для этапа агрегации",
-            output_format="Простой текст (text)",
+            summary_length_ui="Краткое саммари для этапа агрегации",
+            output_format_ui="Простой текст (text)",
             creativity_level="Низкий",
-            selected_model_id=selected_model_id, # Pass the model ID
+            selected_model_id=selected_model_id,
             is_intermediate_summary=True
         )
+        # Пропуск мусорных чанков
+        if intermediate_summary.strip() == "НЕТ_ДАННЫХ_ДЛЯ_САММАРИ":
+            continue
         if intermediate_summary.startswith("Ошибка:") or intermediate_summary.startswith("[ЗАГЛУШКА LLM] Ошибка"):
             st.warning(f"Не удалось суммаризировать чанк {i+1}: {intermediate_summary}")
         else:
@@ -441,10 +434,10 @@ def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, outpu
     status_text.markdown("<small><i>Создание финального саммари из промежуточных результатов...</i></small>", unsafe_allow_html=True)
     final_summary = get_summary_from_llama(
         combined_intermediate_summary,
-        summary_length,
-        output_format,
-        creativity_level,
-        selected_model_id=selected_model_id # Pass the model ID
+        summary_length_ui=summary_length_ui,
+        output_format_ui=output_format_ui,
+        creativity_level=creativity_level,
+        selected_model_id=selected_model_id
     )
     status_text.empty()
     return final_summary

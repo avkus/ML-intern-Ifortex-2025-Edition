@@ -1,0 +1,19 @@
+services:
+  crawl4ai_service:
+    build: ./crawl4ai_service
+    container_name: crawl4ai_service
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # Замените 'streamlit_app' на фактическое имя вашего сервиса, если оно другое
+  streamlit_app:
+    build: .
+    container_name: streamlit_app
+    ports:
+      - "8501:8501"
+    depends_on:
+      - crawl4ai_service
+    restart: unless-stopped
+    volumes:
+      - ./:/app

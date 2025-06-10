@@ -237,5 +237,29 @@ This approach allows the application to process and summarize texts of considera
 4.  **Generate:** Click the "Сгенерировать Саммари" button.
 5.  **View & Download:** The summary will appear in the output area. If successful, a "Скачать Саммари" button will allow you to download the result.
 
+## Новая архитектура: Crawl4AI как отдельный сервис
+
+В проекте теперь используется отдельный сервис `crawl4ai_service` (FastAPI + crawler4ai + Playwright) для извлечения контента из URL. Streamlit-приложение обращается к нему по HTTP API (POST /scrape/). Это решает проблемы с Playwright/asyncio на Windows и упрощает поддержку.
+
+- Все зависимости Playwright/crawler4ai теперь инкапсулированы в Docker-образе crawl4ai_service.
+- Streamlit-приложение не требует установки Playwright/crawler4ai.
+- Запуск проекта: `docker-compose up` (поднимает оба сервиса).
+
+### Пример запроса к сервису crawl4ai_service
+
+POST http://crawl4ai_service:8000/scrape/
+```json
+{
+  "url": "https://docs.crawl4ai.com/"
+}
+```
+Ответ:
+```json
+{
+  "status": "success",
+  "extracted_markdown": "...контент..."
+}
+```
+
 ---
 *This README provides setup and operational details for the LLM Text Summarizer application.*
