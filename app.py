@@ -11,6 +11,7 @@ from dotenv import load_dotenv # Added for .env support
 load_dotenv()
 
 # --- Constants and Session State ---
+CRAWL4AI_API_URL = "http://localhost:11235/api/v1/scrape" # Added Crawl4AI URL
 TOKEN_THRESHOLD = 3500  # Max tokens for direct summarization (conservative for Llama3 8B)
 CHUNK_TARGET_TOKENS = 3000 # Target for each chunk in MapReduce
 CHUNK_OVERLAP_TOKENS = 150   # Overlap for chunks
@@ -46,24 +47,45 @@ def count_tokens(text: str) -> int:
     return len(ENCODING.encode(text))
 
 def fetch_text_from_url(url: str) -> str:
+    """
+    Fetches text content from a URL using the Crawl4AI API.
+    """
+    payload = {"url": url}
+    headers = {"Content-Type": "application/json"}
+
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        for script_or_style in soup(["script", "style"]):
-            script_or_style.decompose()
-        text = soup.get_text(separator='\n', strip=True)
-        cleaned_text = "\n".join([line for line in text.splitlines() if line.strip()])
-        if not cleaned_text:
-            return "Ошибка: Не удалось извлечь основной текстовый контент со страницы."
-        return cleaned_text
-    except requests.exceptions.RequestException as e:
-        return f"Ошибка при запросе к URL: {e}"
+        response = requests.post(CRAWL4AI_API_URL, headers=headers, json=payload, timeout=20) # 20s timeout for API call
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
+
+        response_json = response.json()
+
+        # Try to extract text based on the assumed structure
+        # {'data': {'extracted_text': '...'}}
+        if 'data' in response_json and isinstance(response_json['data'], dict) and \
+           'extracted_text' in response_json['data']:
+            extracted_text = response_json['data']['extracted_text']
+            if isinstance(extracted_text, str) and extracted_text.strip():
+                return extracted_text.strip()
+            else:
+                return "Ошибка: Crawl4AI API вернул пустой или некорректный 'extracted_text'."
+        else:
+            error_detail = json.dumps(response_json) if response_json else "Ответ не содержит JSON."
+            return f"Ошибка: Crawl4AI API вернул неожиданную структуру данных. Ответ: {error_detail[:200]}..."
+
+    except requests.exceptions.ConnectionError:
+        return f"Ошибка: Не удалось подключиться к сервису Crawl4AI по адресу {CRAWL4AI_API_URL}. Убедитесь, что сервис запущен."
+    except requests.exceptions.Timeout:
+        return f"Ошибка: Превышено время ожидания ответа от Crawl4AI API ({CRAWL4AI_API_URL})."
+    except requests.exceptions.HTTPError as http_err:
+        return f"Ошибка: Crawl4AI API вернул ошибку HTTP: {http_err}. Ответ: {response.text[:200]}..."
+    except json.JSONDecodeError:
+        return f"Ошибка: Не удалось декодировать JSON ответ от Crawl4AI API. Ответ: {response.text[:200]}..."
+    except KeyError:
+        # This might occur if 'data' or 'extracted_text' is missing after successful JSON parse
+        return f"Ошибка: В ответе Crawl4AI API отсутствует ожидаемое поле ('data' или 'extracted_text'). Ответ: {json.dumps(response_json)[:200]}..."
     except Exception as e:
-        return f"Ошибка при парсинге страницы: {e}"
+        # Catch any other unexpected errors
+        return f"Неизвестная ошибка при обращении к Crawl4AI API: {e}"
 
 
 def get_summary_from_llama(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str, is_intermediate_summary: bool = False) -> str:
