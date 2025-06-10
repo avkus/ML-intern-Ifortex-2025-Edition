@@ -1,17 +1,20 @@
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
+import requests # Used by get_summary_from_llama
+from bs4 import BeautifulSoup # Still needed for clean_user_text (if any, or general parsing)
 import os
 import json
-import tiktoken # Added for MapReduce
-from dotenv import load_dotenv # Added for .env support
+import tiktoken
+from dotenv import load_dotenv
+import httpx # Added for Crawl4AI
+from typing import Optional # For the return type
+import re # For clean_user_text
 
 # Load environment variables from .env file if it exists
 # This should be one of the first things to run
 load_dotenv()
 
 # --- Constants and Session State ---
-CRAWL4AI_API_URL = "http://localhost:11235/api/v1/scrape" # Added Crawl4AI URL
+CRAWL4AI_API_URL = "https://crawl4ai.interfabrika.online/md"
 TOKEN_THRESHOLD = 3500  # Max tokens for direct summarization (conservative for Llama3 8B)
 CHUNK_TARGET_TOKENS = 3000 # Target for each chunk in MapReduce
 CHUNK_OVERLAP_TOKENS = 150   # Overlap for chunks
@@ -46,47 +49,94 @@ def count_tokens(text: str) -> int:
         return len(text.split())
     return len(ENCODING.encode(text))
 
-def fetch_text_from_url(url: str) -> str:
+def fetch_text_from_url(url: str) -> Optional[str]:
     """
-    Fetches text content from a URL using the Crawl4AI API.
+    Fetches text content as Markdown from a URL using the Crawl4AI API.
+    Uses httpx for the API call.
     """
-    payload = {"url": url}
+    payload = {
+        "url": url,
+        "f": "fit",  # Filter Type: Adaptive content filtering
+        "q": None,   # Query: None
+        "c": "0"     # Cache Mode: Write-Only
+    }
     headers = {"Content-Type": "application/json"}
 
     try:
-        response = requests.post(CRAWL4AI_API_URL, headers=headers, json=payload, timeout=20) # 20s timeout for API call
-        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
+        # httpx is generally used with an explicit client for better resource management,
+        # but for a single call, httpx.post() is fine.
+        with httpx.Client(timeout=30.0) as client: # 30s timeout for API call
+            response = client.post(CRAWL4AI_API_URL, headers=headers, json=payload)
+            response.raise_for_status()  # Raises an HTTPStatusError for bad responses (4XX or 5XX)
 
         response_json = response.json()
 
-        # Try to extract text based on the assumed structure
-        # {'data': {'extracted_text': '...'}}
-        if 'data' in response_json and isinstance(response_json['data'], dict) and \
-           'extracted_text' in response_json['data']:
-            extracted_text = response_json['data']['extracted_text']
-            if isinstance(extracted_text, str) and extracted_text.strip():
-                return extracted_text.strip()
+        if 'extracted_markdown' in response_json:
+            extracted_markdown = response_json['extracted_markdown']
+            if isinstance(extracted_markdown, str) and extracted_markdown.strip():
+                return extracted_markdown.strip()
             else:
-                return "Ошибка: Crawl4AI API вернул пустой или некорректный 'extracted_text'."
+                print("Crawl4AI returned empty or invalid 'extracted_markdown'.")
+                return None
         else:
-            error_detail = json.dumps(response_json) if response_json else "Ответ не содержит JSON."
-            return f"Ошибка: Crawl4AI API вернул неожиданную структуру данных. Ответ: {error_detail[:200]}..."
+            print(f"Crawl4AI API returned unexpected structure: {response_json.get('message', 'No message')}")
+            return None
 
-    except requests.exceptions.ConnectionError:
-        return f"Ошибка: Не удалось подключиться к сервису Crawl4AI по адресу {CRAWL4AI_API_URL}. Убедитесь, что сервис запущен."
-    except requests.exceptions.Timeout:
-        return f"Ошибка: Превышено время ожидания ответа от Crawl4AI API ({CRAWL4AI_API_URL})."
-    except requests.exceptions.HTTPError as http_err:
-        return f"Ошибка: Crawl4AI API вернул ошибку HTTP: {http_err}. Ответ: {response.text[:200]}..."
+    except httpx.TimeoutException:
+        print(f"Timeout: Crawl4AI API ({CRAWL4AI_API_URL}) did not respond in time.")
+        return None
+    except httpx.RequestError as req_err:
+        print(f"Request Error: Could not connect to Crawl4AI API at {CRAWL4AI_API_URL}. Details: {req_err}")
+        return None
+    except httpx.HTTPStatusError as http_err:
+        print(f"HTTP Error: Crawl4AI API returned {http_err.response.status_code}. Response: {http_err.response.text[:200]}...")
+        return None
     except json.JSONDecodeError:
-        return f"Ошибка: Не удалось декодировать JSON ответ от Crawl4AI API. Ответ: {response.text[:200]}..."
+        # response object might not be available if client.post failed before response assigned
+        # For safety, access response.text only if response is confirmed to be an httpx.Response
+        error_response_text = "N/A"
+        if 'response' in locals() and isinstance(response, httpx.Response):
+            error_response_text = response.text[:200]
+        print(f"JSON Error: Could not decode response from Crawl4AI API. Response: {error_response_text}...")
+        return None
     except KeyError:
-        # This might occur if 'data' or 'extracted_text' is missing after successful JSON parse
-        return f"Ошибка: В ответе Crawl4AI API отсутствует ожидаемое поле ('data' или 'extracted_text'). Ответ: {json.dumps(response_json)[:200]}..."
+        # response_json should be available if KeyError occurs
+        error_response_json_text = "N/A"
+        if 'response_json' in locals():
+             error_response_json_text = json.dumps(response_json)[:200]
+        print(f"Key Error: 'extracted_markdown' field missing in Crawl4AI response. Response: {error_response_json_text}...")
+        return None
     except Exception as e:
-        # Catch any other unexpected errors
-        return f"Неизвестная ошибка при обращении к Crawl4AI API: {e}"
+        print(f"Unexpected error while calling Crawl4AI API: {e}")
+        return None
 
+def clean_user_text(raw_text: str) -> str:
+    """
+    Cleans user-inputted text by removing HTML tags and normalizing whitespace.
+    """
+    if not raw_text or not raw_text.strip():
+        return ""
+
+    # 1. Remove HTML tags using BeautifulSoup
+    soup = BeautifulSoup(raw_text, "html.parser")
+    text_without_html = soup.get_text(separator=" ") # Use space as separator to avoid mashing words
+
+    # 2. Normalize whitespace
+    # Replace multiple spaces/tabs with a single space
+    cleaned_text = re.sub(r'[ \t]+', ' ', text_without_html)
+
+    # Reduce multiple newlines to a maximum of two
+    cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+
+    # Replace \r\n (Windows line endings) with \n
+    cleaned_text = cleaned_text.replace('\r\n', '\n')
+    # Replace \r (old Mac line endings) with \n
+    cleaned_text = cleaned_text.replace('\r', '\n')
+
+    # Trim leading/trailing whitespace from the whole text
+    cleaned_text = cleaned_text.strip()
+
+    return cleaned_text
 
 def get_summary_from_llama(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str, is_intermediate_summary: bool = False) -> str:
     if USE_PLACEHOLDER_LLM:
@@ -296,24 +346,43 @@ def main():
     if st.button("Сгенерировать Саммари", key="generate_summary_button"):
         st.session_state.summary_generated_once = True
         st.session_state.output_format_of_summary = output_format_val # Store format for rendering/download
-        text_to_summarize_final = ""
+        text_to_summarize_final = "" # Initialize
 
-        if url_input_val:
+        # Determine active tab/input source
+        # This simple check prioritizes URL input if both have content.
+        # A more robust tab detection might be needed if Streamlit offers better native support for it.
+        if url_input_val: # User provided a URL
             with st.spinner(f"Извлечение текста из {url_input_val}..."):
-                text_to_summarize_final = fetch_text_from_url(url_input_val)
-            if text_to_summarize_final.startswith("Ошибка:"):
-                st.error(text_to_summarize_final); st.session_state.generated_summary = ""; return
-        elif text_input_val:
-            text_to_summarize_final = text_input_val
+                fetched_content = fetch_text_from_url(url_input_val)
+
+            if fetched_content is None or not fetched_content.strip():
+                st.error("Не удалось извлечь контент из указанного URL. Пожалуйста, проверьте ссылку или попробуйте другую.")
+                st.session_state.generated_summary = "" # Clear previous summary
+                return # Stop processing
+            text_to_summarize_final = fetched_content
+            st.markdown("<small><i>Контент извлечен из URL.</i></small>", unsafe_allow_html=True)
+
+        elif text_input_val: # User provided text directly
+            with st.spinner("Очистка введенного текста..."):
+                cleaned_text = clean_user_text(text_input_val)
+            text_to_summarize_final = cleaned_text
+            st.markdown("<small><i>Введенный текст очищен.</i></small>", unsafe_allow_html=True)
         else:
-            st.warning("Пожалуйста, введите текст или URL для суммаризации."); st.session_state.generated_summary = ""; st.session_state.summary_generated_once = False; return
+            st.warning("Пожалуйста, введите текст или URL для суммаризации.")
+            st.session_state.generated_summary = ""
+            st.session_state.summary_generated_once = False # Reset if no input
+            return
 
+        # Post-processing check for empty content
         if not text_to_summarize_final.strip():
-            st.warning("Извлеченный или введенный текст пуст. Нечего суммаризировать."); st.session_state.generated_summary = ""; return
+            st.warning("Нет текста для суммаризации после очистки или извлечения. Пожалуйста, проверьте введенные данные.")
+            st.session_state.generated_summary = ""
+            return
 
-        # Clear previous debug messages area if any
-        # (Not strictly necessary as new messages will overwrite, but good for cleanliness if we had a dedicated area)
+        # Clear previous debug messages area if any specific one exists
+        # For now, new st.markdown messages will appear below previous ones or overwrite if in st.empty
 
+        # Call the summarization logic
         st.session_state.generated_summary = summarize_text_map_reduce(
             text_to_summarize_final,
             summary_length_val,
