@@ -4,3 +4,4 @@ beautifulsoup4
 tiktoken
 python-dotenv
 crawler4ai
+playwright
