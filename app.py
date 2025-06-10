@@ -4,6 +4,11 @@ from bs4 import BeautifulSoup
 import os
 import json
 import tiktoken # Added for MapReduce
+from dotenv import load_dotenv # Added for .env support
+
+# Load environment variables from .env file if it exists
+# This should be one of the first things to run
+load_dotenv()
 
 # --- Constants and Session State ---
 TOKEN_THRESHOLD = 3500  # Max tokens for direct summarization (conservative for Llama3 8B)
