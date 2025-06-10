@@ -11,16 +11,17 @@ This Python application provides text summarization capabilities using a Large L
     *   Choose between "Краткое саммари" (Short) or "Развернутое саммари" (Long).
     *   Select output format: "Простой текст (text)", "Markdown (markdown)", or "HTML (html)".
     *   Adjust "Уровень Креативности" (Creativity Level - Low, Medium, High) which influences the LLM's temperature.
+*   **Selectable LLM Models:** Choose from a configurable list of LLM models (defined in `models.json`), including a local placeholder for testing.
 *   **Handles Long Texts:** Implements a MapReduce strategy (chunking, intermediate summarization, final summarization) for texts exceeding token limits.
 *   **Downloadable Results:** Download the generated summary in the chosen format (`.txt`, `.md`, `.html`).
-*   **Simple UI:** Easy-to-use interface built with Streamlit, including a conceptual theme preference.
+*   **Simple UI:** Easy-to-use interface built with Streamlit.
 
 ## 🛠️ Tech Stack
 
 *   **Python 3.x**
 *   **Streamlit:** For the web interface.
 *   **Requests:** For making HTTP calls to the LLM proxy (`get_summary_from_llama`).
-*   **httpx:** For making asynchronous-capable HTTP calls to the Crawl4AI API (`fetch_text_from_url`).
+*   **crawler4ai:** Python library for advanced web crawling and content extraction from URLs.
 *   **BeautifulSoup4:** For cleaning user-inputted text (removing HTML from `st.text_area` content via `clean_user_text`).
 *   **Tiktoken:** For token counting and text chunking in the MapReduce process.
 *   **python-dotenv:** For managing environment variables locally via a `.env` file.
@@ -58,23 +59,62 @@ This Python application provides text summarization capabilities using a Large L
     PROXY_WORKER_URL="https://your-llm-proxy.workers.dev/api"
     PROXY_MASTER_KEY="your_secret_key_for_llm_proxy"
 
-    # For LLM Model Selection / Placeholder
-    # - To use a specific model via Cloudflare AI (if worker supports it, e.g., "@cf/meta/llama-3-70b-instruct"):
-    #   USE_PLACEHOLDER_LLM="@cf/meta/llama-3-70b-instruct"
-    # - To use a hardcoded dummy placeholder summary for UI testing (no LLM call):
-    #   USE_PLACEHOLDER_LLM="true"
-    # - To use the Cloudflare Worker's default model (leave unset or set to any other value e.g. "false"):
-    #   USE_PLACEHOLDER_LLM="false"
-
     # For Crawl4AI API (Optional)
     # CRAWL4AI_API_KEY="your_crawl4ai_api_key_if_needed"
+
+    # USE_PLACEHOLDER_LLM (Largely Superseded by UI Model Selection via models.json)
+    # This environment variable previously controlled placeholder behavior or forced a specific model.
+    # Its role is now significantly reduced:
+    # - If a model (including the "ЗАГЛУШКА") is selected in the UI via `models.json`,
+    #   this environment variable is IGNORED for that summarization request.
+    # - It might only have an effect as an ultimate fallback if `models.json` is completely missing
+    #   or fails to load in such a way that the UI cannot even offer the default placeholder model
+    #   (the application attempts to prevent this by always loading a default placeholder config).
+    # For clarity, rely on the `models.json` configuration and UI selection for choosing models or placeholders.
+    # Example (mostly for legacy or extreme fallback reference):
+    # USE_PLACEHOLDER_LLM="true"
     ```
     *   `PROXY_WORKER_URL`: The URL of your Cloudflare Worker that proxies requests to the LLM.
     *   `PROXY_MASTER_KEY`: The master API key your Cloudflare Worker expects for authorization.
-    *   `USE_PLACEHOLDER_LLM`: Controls LLM behavior. See comments above for options.
     *   `CRAWL4AI_API_KEY` (Optional): If your Crawl4AI endpoint (`https://crawl4ai.interfabrika.online/md`) requires an API key, provide it here. The application will include it as a Bearer token.
+    *   `USE_PLACEHOLDER_LLM`: See comments above for its now limited role.
 
-5.  **Run the Streamlit Application:**
+5.  **Configure Available LLM Models (`models.json`)**
+
+    The application loads the list of available LLM models from a `models.json` file located in the root directory. This allows you to customize which models are presented to the user in the UI.
+
+    **Structure:**
+    The file should be a JSON array of objects, where each object represents a model:
+    ```json
+    [
+      {
+        "displayName": "Llama 3.3 70B Instruct (FP8)",
+        "modelId": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "provider": "Cloudflare AI",
+        "notes": "Мощная модель, быстрая версия с FP8 квантованием."
+      },
+      {
+        "displayName": "Mistral 7B Instruct v0.1",
+        "modelId": "@cf/mistral/mistral-7b-instruct-v0.1",
+        "provider": "Cloudflare AI",
+        "notes": "Компактная и быстрая модель."
+      },
+      {
+        "displayName": "ЗАГЛУШКА (Тест UI)",
+        "modelId": "placeholder",
+        "provider": "Local",
+        "notes": "Использует локальную заглушку, не делает реальный вызов LLM."
+      }
+    ]
+    ```
+    *   `displayName`: The name shown in the UI's model selection dropdown.
+    *   `modelId`: The identifier passed to the LLM proxy (e.g., specific Cloudflare AI model ID). Use the special value `"placeholder"` to indicate that selecting this option should use the local dummy/placeholder summarization logic.
+    *   `provider`: Informational field indicating the source of the model.
+    *   `notes`: Additional information about the model.
+
+    If `models.json` is missing, corrupted, or empty, the application will default to using a single placeholder model entry defined internally.
+
+6.  **Run the Streamlit Application:**
     ```bash
     streamlit run app.py
     ```
@@ -87,7 +127,8 @@ This application is designed to interact with an LLM (e.g., Llama 3) through a C
 **Key Responsibilities of the Proxy Worker:**
 *   Receive summarization requests from this Streamlit application.
 *   Validate the `Authorization` header using the `PROXY_MASTER_KEY`.
-*   Forward the request payload (system prompt, user prompt, text, temperature, and optionally a specific model like `@cf/meta/llama-3-70b-instruct`) to the actual LLM API endpoint.
+*   Forward the request payload (system prompt, user prompt, text, temperature) to the actual LLM API endpoint.
+*   If a specific LLM model (not the 'ЗАГЛУШКА') is selected in the application's UI, its `modelId` (e.g., `@cf/meta/llama-3.3-70b-instruct-fp8-fast`) is passed to this Cloudflare Worker in the `model` field of the JSON request payload. The Worker should be configured to use this `modelId` to route the request to the corresponding backend LLM.
 *   Include necessary authentication for the LLM provider (e.g., `LLAMA_API_KEY` configured as a secret in Cloudflare).
 *   Return the LLM's response to the Streamlit application.
 
@@ -100,15 +141,17 @@ This application is designed to interact with an LLM (e.g., Llama 3) through a C
         *   `LLAMA_API_KEY`: Your API key for the LLM provider.
         *   `WORKER_MASTER_KEY`: The key that this Streamlit app will use as `PROXY_MASTER_KEY` to authenticate with the worker. The worker should check for `Authorization: Bearer <WORKER_MASTER_KEY>`.
 
-## 🔗 URL Content Extraction (Crawl4AI)
+## 🔗 URL Content Extraction (crawler4ai Library)
 
-For summarizing content from URLs, the application now uses the **Crawl4AI API**.
-*   **Endpoint:** `https://crawl4ai.interfabrika.online/md`
-*   **Method:** The application sends a POST request using `httpx` with a JSON payload containing the target URL and parameters (`"f": "fit"`, `"c": "0"`).
-*   **Output:** Crawl4AI is expected to return a JSON response with the main content of the page in Markdown format, found in the `extracted_markdown` field.
-*   **Authentication (Optional):** If the `CRAWL4AI_API_KEY` environment variable is set, its value will be sent as a `Bearer` token in the `Authorization` header of the request to Crawl4AI. Otherwise, requests are made without this header.
+For summarizing content from URLs, the application now uses the `crawler4ai` Python library. This library provides more robust and higher-quality extraction of main textual content from web pages.
 
-This replaces the previous internal HTML parsing logic for URLs.
+Key configurations for `crawler4ai` in this application include:
+*   `AsyncWebCrawler` is used for performing the asynchronous crawling operations.
+*   `BrowserConfig(headless=True)` ensures that no visible browser window is opened during content extraction.
+*   `CrawlerRunConfig(cache_mode=CacheMode.BYPASS)` is used to fetch fresh content on each request, bypassing any local caching by the crawler.
+
+The library's default mechanisms for identifying and extracting the primary content (which are generally designed to be adaptive and 'fit' the main article) are utilized. The extracted content is expected in Markdown format.
+This replaces the previous direct use of an external API endpoint for URL content extraction.
 
 ## 🧼 User Text Cleaning
 When text is input directly by the user into the text area, it might contain unwanted HTML formatting. The application uses a function `clean_user_text` which utilizes `BeautifulSoup4` to remove these HTML tags and also normalizes excessive whitespace before summarization.
@@ -150,6 +193,7 @@ This approach allows the application to process and summarize texts of considera
     *   **Длина Саммари (Summary Length):** "Краткое" (Short) or "Развернутое" (Long).
     *   **Формат Вывода (Output Format):** "Простой текст", "Markdown", or "HTML".
     *   **Уровень Креативности (Creativity):** "Низкий", "Средний", or "Высокий".
+    *   **Выберите Модель LLM:** Select your desired LLM from the dropdown.
 4.  **Generate:** Click the "Сгенерировать Саммари" button.
 5.  **View & Download:** The summary will appear in the output area. If successful, a "Скачать Саммари" button will allow you to download the result.
 

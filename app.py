@@ -5,9 +5,10 @@ import os
 import json
 import tiktoken
 from dotenv import load_dotenv
-import httpx # Added for Crawl4AI
 from typing import Optional # For the return type
 import re # For clean_user_text
+import asyncio # Added
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode # Added
 
 # Load environment variables from .env file if it exists
 # This should be one of the first things to run
@@ -80,6 +81,45 @@ USE_PLACEHOLDER_LLM = os.getenv("USE_PLACEHOLDER_LLM", "false").lower() == "true
 
 # --- LLM Interaction and Text Processing Functions ---
 
+async def _run_crawler(target_url: str) -> str:
+    """
+    Asynchronously runs the AsyncWebCrawler to fetch and extract content from a URL.
+    Returns the extracted markdown or an error message string.
+    """
+    # print(f"DEBUG: _run_crawler called for URL: {target_url}") # For debugging if needed
+    browser_conf = BrowserConfig(
+        headless=True
+        # user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..." # Example if needed
+    )
+    run_conf = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS
+    )
+
+    try:
+        async with AsyncWebCrawler(config=browser_conf) as crawler:
+            # print(f"DEBUG: AsyncWebCrawler initialized. Calling arun for {target_url}")
+            result = await crawler.arun(
+                url=target_url,
+                config=run_conf
+            )
+            # print(f"DEBUG: arun completed. Result: {type(result)}")
+            # if result:
+            #     print(f"DEBUG: Result fields: markdown={hasattr(result, 'markdown')}, error_message={hasattr(result, 'error_message')}")
+
+        if result and hasattr(result, 'markdown') and result.markdown and isinstance(result.markdown, str):
+            # print("DEBUG: Markdown content found.")
+            return result.markdown.strip()
+        elif result and hasattr(result, 'error_message') and result.error_message:
+            # print(f"DEBUG: Crawl4AI error_message: {result.error_message}")
+            return f"Ошибка от Crawl4AI: {result.error_message}"
+        else:
+            # print("DEBUG: Crawl4AI returned unexpected result or no content.")
+            return "Ошибка: Crawl4AI не вернул контент или вернул неожиданный результат."
+
+    except Exception as e:
+        # print(f"DEBUG: Exception in _run_crawler: {e}")
+        return f"Внутренняя ошибка при выполнении _run_crawler: {e}"
+
 def get_llm_system_prompt(summary_length_key: str, output_format_key: str, is_intermediate: bool) -> str:
     if is_intermediate:
         return ("Сгенерируй очень краткое, фактологическое саммари (1-2 предложения) следующего фрагмента текста. "
@@ -134,72 +174,54 @@ def count_tokens(text: str) -> int:
 
 def fetch_text_from_url(url: str) -> Optional[str]:
     """
-    Fetches text content as Markdown from a URL using the Crawl4AI API.
-    Uses httpx for the API call.
+    Fetches text content as Markdown from a URL using the crawler4ai library.
+    This function is synchronous and uses asyncio.run() to call the async helper.
+    Returns extracted markdown string on success, None on failure.
     """
-    payload = {
-        "url": url,
-        "f": "fit",  # Filter Type: Adaptive content filtering
-        "q": None,   # Query: None
-        "c": "0"     # Cache Mode: Write-Only
-    }
-    # Start with base headers
-    headers = {"Content-Type": "application/json"}
+    if not url or not url.strip():
+        # print("DEBUG: fetch_text_from_url called with empty or invalid URL.") # For debugging
+        return None # Or perhaps an error string specific to invalid input URL
 
-    # Check for optional Crawl4AI API Key
-    crawl4ai_api_key = os.getenv("CRAWL4AI_API_KEY")
-    if crawl4ai_api_key:
-        headers["Authorization"] = f"Bearer {crawl4ai_api_key}"
-        # Optional: print or log that an API key is being used for Crawl4AI
-        # print("DEBUG: Using CRAWL4AI_API_KEY for Crawl4AI request.")
-
+    # print(f"DEBUG: fetch_text_from_url attempting to run crawler for: {url}") # For debugging
     try:
-        # httpx is generally used with an explicit client for better resource management,
-        # but for a single call, httpx.post() is fine.
-        with httpx.Client(timeout=30.0) as client: # 30s timeout for API call
-            # Pass the potentially updated headers
-            response = client.post(CRAWL4AI_API_URL, headers=headers, json=payload)
-            response.raise_for_status()  # Raises an HTTPStatusError for bad responses (4XX or 5XX)
+        # Ensure an event loop exists or can be created by asyncio.run()
+        # In some environments (like certain threads without an active loop),
+        # asyncio.run() might need specific setup or alternatives.
+        # However, for typical Streamlit app execution, asyncio.run() should be fine.
+        extracted_content = asyncio.run(_run_crawler(url))
 
-        response_json = response.json()
+        # print(f"DEBUG: _run_crawler returned: '{extracted_content[:100]}...'") # For debugging
 
-        if 'extracted_markdown' in response_json:
-            extracted_markdown = response_json['extracted_markdown']
-            if isinstance(extracted_markdown, str) and extracted_markdown.strip():
-                return extracted_markdown.strip()
-            else:
-                print("Crawl4AI returned empty or invalid 'extracted_markdown'.")
-                return None
-        else:
-            print(f"Crawl4AI API returned unexpected structure: {response_json.get('message', 'No message')}")
+        if extracted_content.startswith("Ошибка:") or extracted_content.startswith("Внутренняя ошибка при выполнении"):
+            print(f"Error during crawling URL '{url}': {extracted_content}") # Log the specific error from _run_crawler
             return None
 
-    except httpx.TimeoutException:
-        print(f"Timeout: Crawl4AI API ({CRAWL4AI_API_URL}) did not respond in time.")
-        return None
-    except httpx.RequestError as req_err:
-        print(f"Request Error: Could not connect to Crawl4AI API at {CRAWL4AI_API_URL}. Details: {req_err}")
-        return None
-    except httpx.HTTPStatusError as http_err:
-        print(f"HTTP Error: Crawl4AI API returned {http_err.response.status_code}. Response: {http_err.response.text[:200]}...")
-        return None
-    except json.JSONDecodeError:
-        # response object might not be available if client.post failed before response assigned
-        # For safety, access response.text only if response is confirmed to be an httpx.Response
-        error_response_text = "N/A"
-        if 'response' in locals() and isinstance(response, httpx.Response):
-            error_response_text = response.text[:200]
-        print(f"JSON Error: Could not decode response from Crawl4AI API. Response: {error_response_text}...")
-        return None
-    except KeyError:
-        # response_json should be available if KeyError occurs
-        error_response_json_text = "N/A"
-        if 'response_json' in locals():
-             error_response_json_text = json.dumps(response_json)[:200]
-        print(f"Key Error: 'extracted_markdown' field missing in Crawl4AI response. Response: {error_response_json_text}...")
-        return None
+        if not extracted_content.strip(): # Check if crawler returned empty string after stripping
+            print(f"Warning: Crawl4AI returned empty content for URL '{url}'.")
+            return None
+
+        return extracted_content
+
+    except RuntimeError as e:
+        # Catch specific RuntimeError that asyncio.run() might raise if it's called
+        # from a thread that cannot manage a new event loop, or if an event loop is already running.
+        # This is more common in complex threaded/async environments.
+        if "cannot be called when another asyncio event loop is running" in str(e) or \
+           "There is no current event loop in thread" in str(e):
+            print(f"ERROR: asyncio.run() conflict in fetch_text_from_url for '{url}': {e}. "
+                  "This might indicate an issue with Streamlit's threading model or how asyncio is used globally. "
+                  "Consider using nest_asyncio if this is a persistent problem in a notebook-like environment, "
+                  "or structuring async calls differently for Streamlit.")
+            # For a Streamlit app, this error should ideally not occur if Streamlit manages its threads simply.
+            # Fallback to returning None.
+            return None
+        else:
+            # Other RuntimeErrors
+            print(f"ERROR: A RuntimeError occurred in fetch_text_from_url for '{url}': {e}")
+            return None
     except Exception as e:
-        print(f"Unexpected error while calling Crawl4AI API: {e}")
+        # Catch any other general exception during the asyncio.run call or subsequent processing
+        print(f"ERROR: An unexpected error occurred in fetch_text_from_url for '{url}': {e}")
         return None
 
 def clean_user_text(raw_text: str) -> str:
@@ -361,13 +383,13 @@ def text_splitter_intelligent(text: str, target_chunk_tokens: int, overlap_token
     return [chunk for chunk in chunks if count_tokens(chunk) > overlap_tokens / 4 and len(chunk.strip()) > 10]
 
 
-def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str) -> str:
+def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str, selected_model_id: Optional[str]) -> str:
     total_tokens = count_tokens(text_to_summarize)
     st.markdown(f"<small><i>Отладочная информация: Общее количество токенов: {total_tokens}</i></small>", unsafe_allow_html=True)
 
     if total_tokens <= TOKEN_THRESHOLD:
         st.markdown("<small><i>Отладочная информация: Текст короткий, используется прямое суммирование.</i></small>", unsafe_allow_html=True)
-        return get_summary_from_llama(text_to_summarize, summary_length, output_format, creativity_level)
+        return get_summary_from_llama(text_to_summarize, summary_length, output_format, creativity_level, selected_model_id)
 
     st.markdown(f"<small><i>Отладочная информация: Текст длинный ({total_tokens} токенов), используется MapReduce.</i></small>", unsafe_allow_html=True)
     chunks = text_splitter_intelligent(text_to_summarize, CHUNK_TARGET_TOKENS, CHUNK_OVERLAP_TOKENS)
@@ -388,6 +410,7 @@ def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, outpu
             summary_length="Краткое саммари для этапа агрегации",
             output_format="Простой текст (text)",
             creativity_level="Низкий",
+            selected_model_id=selected_model_id, # Pass the model ID
             is_intermediate_summary=True
         )
         if intermediate_summary.startswith("Ошибка:") or intermediate_summary.startswith("[ЗАГЛУШКА LLM] Ошибка"):
@@ -420,7 +443,8 @@ def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, outpu
         combined_intermediate_summary,
         summary_length,
         output_format,
-        creativity_level
+        creativity_level,
+        selected_model_id=selected_model_id # Pass the model ID
     )
     status_text.empty()
     return final_summary
