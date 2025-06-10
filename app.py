@@ -361,13 +361,13 @@ def text_splitter_intelligent(text: str, target_chunk_tokens: int, overlap_token
     return [chunk for chunk in chunks if count_tokens(chunk) > overlap_tokens / 4 and len(chunk.strip()) > 10]
 
 
-def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str) -> str:
+def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, output_format: str, creativity_level: str, selected_model_id: Optional[str]) -> str:
     total_tokens = count_tokens(text_to_summarize)
     st.markdown(f"<small><i>Отладочная информация: Общее количество токенов: {total_tokens}</i></small>", unsafe_allow_html=True)
 
     if total_tokens <= TOKEN_THRESHOLD:
         st.markdown("<small><i>Отладочная информация: Текст короткий, используется прямое суммирование.</i></small>", unsafe_allow_html=True)
-        return get_summary_from_llama(text_to_summarize, summary_length, output_format, creativity_level)
+        return get_summary_from_llama(text_to_summarize, summary_length, output_format, creativity_level, selected_model_id)
 
     st.markdown(f"<small><i>Отладочная информация: Текст длинный ({total_tokens} токенов), используется MapReduce.</i></small>", unsafe_allow_html=True)
     chunks = text_splitter_intelligent(text_to_summarize, CHUNK_TARGET_TOKENS, CHUNK_OVERLAP_TOKENS)
@@ -388,6 +388,7 @@ def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, outpu
             summary_length="Краткое саммари для этапа агрегации",
             output_format="Простой текст (text)",
             creativity_level="Низкий",
+            selected_model_id=selected_model_id, # Pass the model ID
             is_intermediate_summary=True
         )
         if intermediate_summary.startswith("Ошибка:") or intermediate_summary.startswith("[ЗАГЛУШКА LLM] Ошибка"):
@@ -420,7 +421,8 @@ def summarize_text_map_reduce(text_to_summarize: str, summary_length: str, outpu
         combined_intermediate_summary,
         summary_length,
         output_format,
-        creativity_level
+        creativity_level,
+        selected_model_id=selected_model_id # Pass the model ID
     )
     status_text.empty()
     return final_summary
