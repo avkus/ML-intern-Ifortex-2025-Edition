@@ -3,4 +3,4 @@ requests
 beautifulsoup4
 tiktoken
 python-dotenv
-httpx
+crawler4ai

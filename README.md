@@ -21,7 +21,7 @@ This Python application provides text summarization capabilities using a Large L
 *   **Python 3.x**
 *   **Streamlit:** For the web interface.
 *   **Requests:** For making HTTP calls to the LLM proxy (`get_summary_from_llama`).
-*   **httpx:** For making asynchronous-capable HTTP calls to the Crawl4AI API (`fetch_text_from_url`).
+*   **crawler4ai:** Python library for advanced web crawling and content extraction from URLs.
 *   **BeautifulSoup4:** For cleaning user-inputted text (removing HTML from `st.text_area` content via `clean_user_text`).
 *   **Tiktoken:** For token counting and text chunking in the MapReduce process.
 *   **python-dotenv:** For managing environment variables locally via a `.env` file.
@@ -141,15 +141,17 @@ This application is designed to interact with an LLM (e.g., Llama 3) through a C
         *   `LLAMA_API_KEY`: Your API key for the LLM provider.
         *   `WORKER_MASTER_KEY`: The key that this Streamlit app will use as `PROXY_MASTER_KEY` to authenticate with the worker. The worker should check for `Authorization: Bearer <WORKER_MASTER_KEY>`.
 
-## 🔗 URL Content Extraction (Crawl4AI)
+## 🔗 URL Content Extraction (crawler4ai Library)
 
-For summarizing content from URLs, the application now uses the **Crawl4AI API**.
-*   **Endpoint:** `https://crawl4ai.interfabrika.online/md`
-*   **Method:** The application sends a POST request using `httpx` with a JSON payload containing the target URL and parameters (`"f": "fit"`, `"c": "0"`).
-*   **Output:** Crawl4AI is expected to return a JSON response with the main content of the page in Markdown format, found in the `extracted_markdown` field.
-*   **Authentication (Optional):** If the `CRAWL4AI_API_KEY` environment variable is set, its value will be sent as a `Bearer` token in the `Authorization` header of the request to Crawl4AI. Otherwise, requests are made without this header.
+For summarizing content from URLs, the application now uses the `crawler4ai` Python library. This library provides more robust and higher-quality extraction of main textual content from web pages.
 
-This replaces the previous internal HTML parsing logic for URLs.
+Key configurations for `crawler4ai` in this application include:
+*   `AsyncWebCrawler` is used for performing the asynchronous crawling operations.
+*   `BrowserConfig(headless=True)` ensures that no visible browser window is opened during content extraction.
+*   `CrawlerRunConfig(cache_mode=CacheMode.BYPASS)` is used to fetch fresh content on each request, bypassing any local caching by the crawler.
+
+The library's default mechanisms for identifying and extracting the primary content (which are generally designed to be adaptive and 'fit' the main article) are utilized. The extracted content is expected in Markdown format.
+This replaces the previous direct use of an external API endpoint for URL content extraction.
 
 ## 🧼 User Text Cleaning
 When text is input directly by the user into the text area, it might contain unwanted HTML formatting. The application uses a function `clean_user_text` which utilizes `BeautifulSoup4` to remove these HTML tags and also normalizes excessive whitespace before summarization.
